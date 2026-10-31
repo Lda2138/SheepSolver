@@ -1,0 +1,8 @@
+# Compatible with the existing Python 3.13 environment. The original mitmproxy 9
+# pin targets older Python releases; keep the upstream requirements untouched.
+mitmproxy==12.2.3
+certifi>=2026.7.22
+urllib3>=2.8.0,<3
+Pillow>=12.3.0,<13
+pywin32>=311
+numpy>=2.5.0,<3

@@ -1,0 +1,9 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>羊了个羊 · 自动地图抓取</title>
+<style>body{margin:0;background:#f3f5f1;color:#26342d;font:16px/1.7 system-ui}main{max-width:800px;margin:7vh auto;padding:32px}h1{font-size:30px}section{background:white;border-radius:20px;padding:26px;margin:20px 0}small{color:#66756c}strong{font-size:22px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}span{display:inline-block;padding:6px 12px;border-radius:8px;background:#edf3eb;margin:6px 6px 0 0}</style>
+<main><small>NB-Dragon / SheepSolver</small><h1>开局后，自动获取完整地图</h1>
+<section><strong id="message">正在连接本地抓取服务…</strong><p id="service"></p><span id="maps">地图：等待开局</span><span id="seed">真实种子：等待</span><span id="solver">求解：等待</span></section>
+<section><b>当前局数据</b><pre id="session">尚未获取当前局地图。</pre><small>只有地图中每张牌的类型齐全，才会运行原项目求解器。重新开局会建立新记录。新版加密种子未解出时会持续显示等待。</small></section>
+<small>后台程序不会移动鼠标或激活微信。结束时双击「停止自动抓取.bat」，恢复临时代理和证书。服务最多运行 4 小时。</small></main>
+<script>const el=id=>document.getElementById(id);async function refresh(){try{const r=await fetch('/status',{cache:'no-store'});const {capture:c,service:s}=await r.json();el('message').textContent=c.message||'等待游戏';el('service').textContent=s.message||'';el('maps').textContent=`完整地图：${c.complete_maps||0} / ${c.map_count||0}`;el('seed').textContent='真实种子：'+(c.seed_received?'已获取':'等待');const labels={not_started:'等待',running:'正在求解',solved:'已求解并验证',no_solution_within_limit:'限时内未找到解',timed_out:'已超时',unsupported_state:'此局规则暂不支持'};el('solver').textContent='求解：'+(labels[c.solver]||'等待');el('session').textContent=c.session?`局号：${c.session}\n地图 ID：${(c.map_ids||[]).join('\n')}\n完整数据：${c.current_map||'尚未生成'}\n最后更新：${c.updated_at||''}`:'尚未捕获开局信息。'}catch{el('message').textContent='抓取服务未运行或已停止';el('service').textContent='启动后重新打开此页面。'}}refresh();setInterval(refresh,1500)</script></html>

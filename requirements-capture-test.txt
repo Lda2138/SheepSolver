@@ -1,0 +1,2 @@
+# Optional dependency to independently generate LZ-string protocol fixtures.
+lzstring==1.0.4

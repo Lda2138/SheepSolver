@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SheepSolver 点击预演</title>
+<style>
+body{margin:0;background:#eef5e9;color:#173226;font:16px system-ui}main{max-width:1080px;margin:24px auto;padding:20px}h1{font-size:25px;margin:0 0 8px}.panel{background:white;border-radius:16px;padding:20px;box-shadow:0 4px 22px #17322612}.layout{display:grid;grid-template-columns:1fr 300px;gap:20px;margin-top:20px}canvas{width:100%;background:#baf38c;border-radius:12px}button{font:inherit;border:0;border-radius:8px;padding:10px 15px;background:#256c48;color:white;cursor:pointer;margin:4px}button:disabled{opacity:.4;cursor:default}.note{color:#58705e;line-height:1.65}.badge{display:inline-block;padding:4px 10px;border-radius:6px;background:#fff0ce;color:#785000}#tray{display:flex;gap:5px;min-height:40px;padding:8px;background:#eef5e9;border-radius:8px}#tray span{padding:8px;border-radius:5px;background:white}#next{font-weight:600;line-height:1.8}ol{padding-left:24px;height:230px;overflow:auto;font-size:14px}@media(max-width:720px){.layout{grid-template-columns:1fr}}
+#energy[hidden]{display:none}
+</style><main>
+<h1>SheepSolver 点击预演</h1><span class="badge">离线模拟 · 不控制微信或鼠标</span>
+<p id="source" class="note"></p>
+<div class="layout"><section class="panel"><canvas id="board" width="680" height="800"></canvas></section>
+<section class="panel"><h2>下一张牌</h2><p id="next"></p><button id="step">模拟下一次点击</button><button id="play">连续预演</button><button id="reset">重置</button><p id="progress"></p><p id="energy" class="badge" hidden></p><h3>牌槽</h3><div id="tray"></div><p class="note">红框标记求解器建议的下一张牌。数字表示地图的牌类型，不代表当前微信的皮肤图案。电量牌下方的小格表示剩余电量。也可点击红框逐步预演。</p><h3>步骤记录</h3><ol id="log"></ol></section></div>
+</main><script>
+const data=__PAYLOAD__;
+const canvas=document.querySelector('#board'),ctx=canvas.getContext('2d');
+const cards=new Map(data.cards.map(c=>[c.id,c]));
+const minX=Math.min(...data.cards.map(c=>c.rolNum)),minY=Math.min(...data.cards.map(c=>c.rowNum));
+const maxX=Math.max(...data.cards.map(c=>c.rolNum))+8,maxY=Math.max(...data.cards.map(c=>c.rowNum))+8;
+const scale=Math.min(600/(maxX-minX),720/(maxY-minY)),x0=40-minX*scale,y0=40-minY*scale;
+let remaining,index,tray,charges,energyCount,alienCount,timer=null,rngA=0n,rngB=0n;
+const energyMode=data.rules&&data.rules.kind==='energy_alien_v1';
+const mask64=(1n<<64n)-1n;
+function randomColor(){let sum=(rngA+rngB)&mask64,x=rngA,y=rngB;rngA=y;x^=(x<<23n)&mask64;rngB=(x^y^(x>>18n)^(y>>5n))&mask64;return Number(sum>>32n)*2.3283064365386963e-10+Number((sum&0xffffffffn)>>12n)*2.220446049250313e-16;}
+function changeColors(){if(!data.rules||data.rules.kind!=='color_shuffle_v1')return;let ids=data.rules.special_initial.map(c=>c.id).filter(id=>remaining.has(id)),values=ids.map(id=>cards.get(id).type);if(ids.length>1)for(let k=ids.length-1;k>=0;k--){let j=Math.floor(randomColor()*(k+1));[values[k],values[j]]=[values[j],values[k]];}ids.forEach((id,k)=>cards.get(id).type=values[k]);}
+const intersect=(a,b)=>Math.abs(a.rolNum-b.rolNum)<8&&Math.abs(a.rowNum-b.rowNum)<8;
+const blocked=c=>[...remaining].some(id=>{const b=cards.get(id);return b.layer>c.layer&&intersect(c,b)});
+const rect=c=>[x0+c.rolNum*scale,y0+c.rowNum*scale,8*scale,8*scale];
+function draw(){
+ ctx.clearRect(0,0,680,800);
+ for(const c of data.cards){if(!remaining.has(c.id))continue;const [x,y,w,h]=rect(c);const covered=blocked(c);
+ ctx.fillStyle=covered?'#8fa880':'#fffbea';ctx.strokeStyle='#607b53';ctx.lineWidth=2;ctx.fillRect(x+1,y+1,w-2,h-2);ctx.strokeRect(x+1,y+1,w-2,h-2);ctx.fillStyle=covered?'#637b58':'#163c28';ctx.font=`bold ${Math.max(14,w*.42)}px system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(String(c.type),x+w/2,y+h/2);
+ if(energyMode&&!covered&&charges.get(c.id)>0)for(let k=0;k<4;k++){ctx.fillStyle=k<charges.get(c.id)?'#f3bb22':'#ded7bc';ctx.fillRect(x+w*.15+k*w*.18,y+h*.8,w*.14,h*.09);}
+ }
+ const next=cards.get(data.sequence[index]);
+ if(next){const [x,y,w,h]=rect(next);ctx.strokeStyle='#e62737';ctx.lineWidth=5;ctx.strokeRect(x-1,y-1,w+2,h+2);document.querySelector('#next').textContent=`第 ${index+1} 步：类型 ${next.type} / 牌 ${next.id}`;}
+ else document.querySelector('#next').textContent='预演完成，棋盘和牌槽均已清空';
+ document.querySelector('#progress').textContent=`已模拟 ${index} / ${data.sequence.length} 次点击`;
+ const energy=document.querySelector('#energy');energy.hidden=!energyMode;if(energyMode)energy.textContent=alienCount?`飞碟已召唤 ${alienCount} 次 · 剩余 ${remaining.size} 张牌`:`已收集电量 ${energyCount} / ${data.rules.collect_count}`;
+ document.querySelector('#tray').replaceChildren(...tray.map(t=>{const s=document.createElement('span');s.textContent=t;return s}));
+ document.querySelector('#step').disabled=!next;document.querySelector('#play').disabled=!next;
+}
+function step(){if(index>=data.sequence.length){stop();return}const id=data.sequence[index],c=cards.get(id);if(!remaining.has(id)||blocked(c)){stop();throw Error('模拟目标被遮挡或已移除')}
+ const oldExposed=energyMode?[...charges.keys()].filter(other=>other!==id&&remaining.has(other)&&!blocked(cards.get(other))):[];
+ if(data.sequence_types&&data.sequence_types[index]!==c.type)throw Error('逐步牌型不一致');remaining.delete(id);const type=c.type;tray.push(type);if(tray.filter(t=>t===type).length===3){tray=tray.filter(t=>t!==type);changeColors();}let event=null;if(energyMode){event=data.energy_events[index];if(event.card!==id)throw Error('特殊牌事件不一致');charges.set(id,0);oldExposed.forEach(other=>charges.set(other,Math.max(0,charges.get(other)-1)));energyCount=event.energy_count;if(event.alien){alienCount++;charges.forEach((v,id)=>charges.set(id,0));}event.auto_removed.forEach(id=>remaining.delete(id));tray=event.tray.slice();}if(tray.length>=7){stop();throw Error('牌槽已满')}
+ const li=document.createElement('li');li.textContent=`${id} · 类型 ${c.type}`+(event&&event.collected?' · 收集电量':'')+(event&&event.alien?` · 飞碟移除 ${event.auto_removed.length} 张棋盘牌并清空牌槽`:'');document.querySelector('#log').append(li);li.scrollIntoView({block:'nearest'});index++;draw();if(index===data.sequence.length)stop();}
+function stop(){clearInterval(timer);timer=null;document.querySelector('#play').textContent='连续预演'}
+function reset(){stop();remaining=new Set(cards.keys());index=0;tray=[];charges=new Map(data.cards.filter(c=>c.metaType===3).map(c=>[c.id,c.metaData]));energyCount=0;alienCount=0;if(data.rules&&data.rules.kind==='color_shuffle_v1'){const seed=data.rules.seed;rngA=(BigInt(seed[0]>>>0)<<32n)|BigInt(seed[1]>>>0);rngB=(BigInt(seed[2]>>>0)<<32n)|BigInt(seed[3]>>>0);randomColor();for(let k=0;k<data.rules.pool_draws;k++)randomColor();data.rules.special_initial.forEach(c=>cards.get(c.id).type=c.type);changeColors();}document.querySelector('#log').replaceChildren();draw()}
+document.querySelector('#source').textContent=`数据来源：${data.source_label}。已校验 ${data.card_count} 张牌、${data.sequence.length} 次点击，求解耗时 ${data.elapsed_seconds??'未记录'} 秒。`;
+document.querySelector('#step').onclick=step;document.querySelector('#reset').onclick=reset;
+document.querySelector('#play').onclick=()=>{if(timer){stop();return}timer=setInterval(step,300);document.querySelector('#play').textContent='暂停预演'};
+canvas.onclick=e=>{const c=cards.get(data.sequence[index]);if(!c)return;const r=canvas.getBoundingClientRect(),px=(e.clientX-r.left)*canvas.width/r.width,py=(e.clientY-r.top)*canvas.height/r.height;const [x,y,w,h]=rect(c);if(px>=x&&px<=x+w&&py>=y&&py<=y+h)step()};reset();
+</script></html>

@@ -1,0 +1,2 @@
+# Exact whole-board planning. Existing capture dependencies remain separate.
+ortools==9.15.6755

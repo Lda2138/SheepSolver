@@ -1,4 +1,11 @@
 .idea
 automatic
 static/map
-test
+venv/
+output/
+__pycache__/
+*.pyc
+# 构建产物（由 build_clicker.ps1 生成）
+/*.exe
+# 本地归档（含旧截图与本机路径，不公开）
+_archive/
