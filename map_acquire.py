@@ -14,7 +14,7 @@ import sqlite3
 import time
 
 ROOT = Path(__file__).resolve().parent
-APPLET = Path.home() / 'AppData/Roaming/Tencent/xwechat/radium/users/47e4cfd834b761448b3c00c953d8ed27/applet'
+WECHAT_USERS = Path.home() / 'AppData/Roaming/Tencent/xwechat/radium/users'
 K = C.WinDLL('kernel32', use_last_error=True)
 K.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
 K.OpenProcess.restype = W.HANDLE
@@ -146,10 +146,23 @@ def scan(pid, found, cap_mb):
     print(json.dumps({'pid': pid, 'scanned_mb': round(total/1024**2, 1), 'marker_hits': hits, 'seconds': round(time.monotonic()-started, 2)}), flush=True)
 
 
-def inspect_cache():
-    package = APPLET / 'packages/wx141bfb9b73c970a9/500'
+def resolve_applet_dir(explicit=None, users_dir=None):
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_dir():
+            raise ValueError('指定的小程序目录不存在: ' + str(path))
+        return path
+    users_dir = Path(users_dir) if users_dir is not None else WECHAT_USERS
+    matches = sorted(p for p in users_dir.glob('*/applet') if p.is_dir())
+    if len(matches) != 1:
+        raise ValueError('未找到唯一的小程序目录，请使用 --applet-dir 指定')
+    return matches[0]
+
+
+def inspect_cache(applet):
+    package = applet / 'packages/wx141bfb9b73c970a9/500'
     print('package headers:', [(p.name, p.read_bytes()[:18].hex()) for p in package.glob('*.wxapkg')])
-    data = APPLET / 'data/8'
+    data = applet / 'data/8'
     print('data entries:', [(p.name, p.stat().st_size if p.is_file() else 'directory') for p in data.iterdir()])
     try:
         con = sqlite3.connect((data / 'applet.db').as_uri()+'?mode=ro', uri=True)
@@ -164,9 +177,13 @@ def main():
     parser.add_argument('--pids', nargs='*', type=int, default=[])
     parser.add_argument('--cap-mb', type=int, default=600)
     parser.add_argument('--inspect-cache', action='store_true')
+    parser.add_argument('--applet-dir', help='微信用户的 applet 目录；省略时仅在能唯一确定时自动发现')
     args = parser.parse_args()
     if args.inspect_cache:
-        inspect_cache()
+        try:
+            inspect_cache(resolve_applet_dir(args.applet_dir))
+        except ValueError as exc:
+            parser.error(str(exc))
     found = {}
     for pid in args.pids:
         scan(pid, found, args.cap_mb)
