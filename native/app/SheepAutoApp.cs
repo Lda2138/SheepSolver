@@ -139,15 +139,15 @@ sealed class AutoSheepForm : Form {
     readonly Stepper pipeline=new Stepper("抓取","种子","地图","解答","执行");
     readonly FlatButton primary=new FlatButton(),stop=new FlatButton(),refresh=new FlatButton(),detailToggle=new FlatButton(),propGuide=new FlatButton(),settingsLink=new FlatButton();
     readonly CardPanel detailBox=new CardPanel{Border=false,BackColor=Ui.Soft};
-    readonly ComboBox performance=new ComboBox(),speed=new ComboBox();readonly NumericUpDown seconds=new NumericUpDown();readonly ThinBar playBar=new ThinBar();
-    readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer();readonly StringBuilder events=new StringBuilder();Dictionary<string,object> snapshot;
-    bool connecting,closing,closeReady,suppress,autoSent,showDetail=true;string primaryAction="start";DateTime lastConnect=DateTime.MinValue,lastImageTime=DateTime.MinValue;string lastImage="",lastEvent="",state="connecting";
+    readonly ComboBox performance=new ComboBox(),speed=new ComboBox(),verification=new ComboBox();readonly NumericUpDown seconds=new NumericUpDown(),checkInterval=new NumericUpDown();readonly ThinBar playBar=new ThinBar();
+    readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer(),propKeys=new System.Windows.Forms.Timer();readonly StringBuilder events=new StringBuilder();Dictionary<string,object> snapshot;
+    bool connecting,closing,closeReady,suppress,autoSent,showDetail=true,oldPropPause,oldPropStop;string primaryAction="start";DateTime lastConnect=DateTime.MinValue,lastImageTime=DateTime.MinValue;string lastImage="",lastEvent="",state="connecting";
     public AutoSheepForm(string directory,bool demo=false,bool start=false){
         root=directory;preview=demo;autoStart=start;DoubleBuffered=true;AutoScaleMode=AutoScaleMode.None;Font=Ui.F(9.5f);BackColor=Ui.Page;ForeColor=ink;Text="羊羊助手";StartPosition=FormStartPosition.CenterScreen;
         string icon=Path.Combine(root,"assets","sheep.ico");if(File.Exists(icon))Icon=new Icon(icon);Build();float scale;using(var g=Graphics.FromHwnd(IntPtr.Zero))scale=g.DpiX/96f;ScaleTree(this,scale);
         MinimumSize=new Size((int)(960*scale),(int)(700*scale));Size=new Size(Math.Min((int)(1120*scale),Screen.PrimaryScreen.WorkingArea.Width-40),Math.Min((int)(800*scale),Screen.PrimaryScreen.WorkingArea.Height-30));
-        if(preview){Demo();DemoSearch();}else{timer.Interval=250;timer.Tick+=async delegate{await Poll();};Shown+=async delegate{timer.Start();await Poll();};FormClosing+=OnClosing;}
-        FormClosed+=delegate{timer.Dispose();};
+        if(preview){Demo();DemoSearch();}else{timer.Interval=250;timer.Tick+=async delegate{await Poll();};Shown+=async delegate{timer.Start();propKeys.Start();await Poll();};propKeys.Interval=50;propKeys.Tick+=delegate{if(closing||V(D(snapshot,"playback"),"execution_kind")!="manual_move_out_live_v1")return;bool pauseKey=(Native.GetAsyncKeyState(0x77)&0x8000)!=0,stopKey=(Native.GetAsyncKeyState(0x78)&0x8000)!=0;if(pauseKey&&!oldPropPause)Send(state=="paused"?"start":"pause");if(stopKey&&!oldPropStop)Send("stop");oldPropPause=pauseKey;oldPropStop=stopKey;};FormClosing+=OnClosing;}
+        FormClosed+=delegate{timer.Dispose();propKeys.Dispose();};
     }
     Label TextLabel(string text,float size=9.5f,bool bold=false){return new StableLabel{Text=text,Dock=DockStyle.Fill,Font=Ui.F(size,bold),ForeColor=ink,Margin=new Padding(0),TextAlign=ContentAlignment.MiddleLeft,AutoEllipsis=true};}
     void ButtonStyle(FlatButton b,string text,bool main=false,bool link=false){b.Text=text;b.Dock=DockStyle.Fill;b.Main=main;b.Link=link;b.Margin=new Padding(0);}
@@ -193,6 +193,8 @@ sealed class AutoSheepForm : Form {
         searchText.Dock=DockStyle.Fill;searchText.ForeColor=muted;searchText.BackColor=Ui.Soft;searchText.Font=Ui.F(8.75f);searchText.TextAlign=ContentAlignment.TopLeft;searchText.Text="";detailBox.Controls.Add(searchText,0,0);right.Controls.Add(detailBox,0,10);
 
         speed.DropDownStyle=ComboBoxStyle.DropDownList;speed.Items.AddRange(new object[]{"稳妥 · 2 秒/步","快速 · 1.2 秒/步","极速 · 动态核对"});speed.SelectedIndex=1;speed.SelectedIndexChanged+=delegate{if(!suppress)Send("settings");};
+        verification.DropDownStyle=ComboBoxStyle.DropDownList;verification.Items.AddRange(new object[]{"逐步核对（默认）","超高速 · 只确认目标牌消失","安全超高速 · 定期全盘核对"});verification.SelectedIndex=0;verification.SelectedIndexChanged+=delegate{if(!suppress)Send("settings");};
+        checkInterval.Minimum=1;checkInterval.Maximum=1000;checkInterval.Value=30;checkInterval.ValueChanged+=delegate{if(!suppress)Send("settings");};
         performance.DropDownStyle=ComboBoxStyle.DropDownList;performance.Items.AddRange(new object[]{"省资源 · 单路","快速 · 自动并行","全速 · 空闲资源"});performance.SelectedIndex=2;performance.SelectedIndexChanged+=delegate{if(!suppress)Send("settings");};
         seconds.Minimum=30;seconds.Maximum=300;seconds.Increment=30;seconds.Value=180;seconds.ValueChanged+=delegate{if(!suppress)Send("settings");};
 
@@ -204,7 +206,7 @@ sealed class AutoSheepForm : Form {
     static string Range(Dictionary<string,object> d,string min,string max){return V(d,min)==V(d,max)?V(d,min):V(d,min)+"～"+V(d,max);}
     static bool B(Dictionary<string,object> d,string key){return d!=null&&d.ContainsKey(key)&&d[key]!=null&&Convert.ToBoolean(d[key]);}
     static Dictionary<string,object> D(Dictionary<string,object> d,string key){return d!=null&&d.ContainsKey(key)&&d[key] is Dictionary<string,object>?(Dictionary<string,object>)d[key]:new Dictionary<string,object>();}
-    Dictionary<string,object> Settings(){return new Dictionary<string,object>{{"performance",performance.SelectedIndex},{"click_speed",speed.SelectedIndex},{"seconds",(int)seconds.Value}};}
+    Dictionary<string,object> Settings(){return new Dictionary<string,object>{{"performance",performance.SelectedIndex},{"click_speed",speed.SelectedIndex},{"seconds",(int)seconds.Value},{"verification_mode",new[]{"normal","ultra","safe_ultra"}[Math.Max(0,verification.SelectedIndex)]},{"full_check_interval",(int)checkInterval.Value}};}
     void Send(string action){if(preview||closing)return;try{string directory=Path.Combine(root,"output","workflow","commands");Directory.CreateDirectory(directory);string id=DateTime.UtcNow.Ticks+"_"+Guid.NewGuid().ToString("N");string path=Path.Combine(directory,id+".json"),temp=path+".tmp";File.WriteAllText(temp,json.Serialize(new Dictionary<string,object>{{"action",action},{"settings",Settings()}}),new UTF8Encoding(false));File.Move(temp,path);if(action=="start"){primary.Text="正在接续…";primary.Enabled=false;}Event("操作："+(action=="start"?"开始或继续托管":action=="pause"?"暂停托管":action=="stop"?"停止托管":action=="settings"?"更新速度与性能":action));}catch(Exception e){message.Text=e.Message;}}
     async Task Connect(){if(connecting||DateTime.UtcNow-lastConnect<TimeSpan.FromSeconds(3))return;connecting=true;lastConnect=DateTime.UtcNow;try{await Task.Run(()=>{using(var p=Process.Start(new ProcessStartInfo{FileName=Path.Combine(root,"venv","Scripts","python.exe"),Arguments="\""+Path.Combine(root,"workflow_controller.py")+"\" start",WorkingDirectory=root,UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true})){string error=p.StandardError.ReadToEnd();p.StandardOutput.ReadToEnd();if(!p.WaitForExit(10000)||p.ExitCode!=0)throw new Exception(error);}});}catch(Exception e){message.Text="后台连接失败："+e.Message;}finally{connecting=false;}}
     async Task Poll(){if(closing||preview)return;try{string path=Path.Combine(root,"output","workflow","status.json");bool alive=false;
@@ -216,7 +218,7 @@ sealed class AutoSheepForm : Form {
     static string SearchPhase(string phase){switch(phase){case "prop_search":return "一次移出搜索";case "native":return "原生搜索";case "beam":return "快速候选搜索";case "candidate_diagnosis":return "残局核查与冲突压缩";case "repairing":return "修改候选选择";case "building":case "positions":return "构建模型";case "type_occurrences":return "三消配对";case "model_ready":return "模型就绪";case "presolve":return "预处理";case "search":return "搜索";default:return phase;}}
     static void SetProgress(ThinBar bar,int maximum,int value,ProgressBarStyle style){bar.Set(maximum,value,style);}
     void Apply(Dictionary<string,object> d){snapshot=d;state=V(d,"state");string text;
-        switch(state){case "waiting_retry":text="正在自动换策略";break;case "disconnected":text="准备开始";break;case "waiting_start":text="等待游戏开局";break;case "waiting_capture":text="正在恢复抓取连接";break;case "waiting_window":text="等待游戏窗口恢复显示";break;case "waiting_new_map":text="等待本局地图与种子";break;case "waiting_resume":text="正在恢复点击进度";break;case "waiting_input":text="后台点击暂未生效";break;case "waiting_seed":text="等待种子解密";break;case "identifying":text="正在识别棋盘";break;case "solving":text="正在搜索完整答案";break;case "search_limited":text="本轮尚未找到完整路线";break;case "preparing":text="正在自动对齐";break;case "ready":text=B(d,"can_resume")?"断点已核对，可以续接":"棋盘已就绪";break;case "playing":case "verifying":text="正在自动通关";break;case "planning_segment":text="正在计算下一小段";break;case "waiting_new_game":text="等待重新开局";break;case "learning":text="正在学习新牌型";break;case "waiting_target":text="等待临时提示消失";break;case "paused":text="托管已暂停";break;case "blocked":text="需要处理";break;case "stopped":text="托管已停止";break;case "finished":text="答案已执行完毕";break;case "waiting_board":text="正在等待棋盘或地图更新";break;case "restoring":text="正在恢复设置";break;default:text="正在连接服务";break;}
+        switch(state){case "waiting_retry":text="正在自动换策略";break;case "disconnected":text="准备开始";break;case "waiting_start":text="等待游戏开局";break;case "waiting_capture":text="正在恢复抓取连接";break;case "waiting_window":text="等待游戏窗口恢复显示";break;case "waiting_new_map":text="等待本局地图与种子";break;case "waiting_resume":text="正在恢复点击进度";break;case "waiting_input":text="后台点击暂未生效";break;case "waiting_seed":text="等待种子解密";break;case "identifying":text="正在识别棋盘";break;case "solving":text="正在搜索完整答案";break;case "search_limited":text="本轮尚未找到完整路线";break;case "preparing":text="正在自动对齐";break;case "ready":text=B(d,"can_resume")?"断点已核对，可以续接":"棋盘已就绪";break;case "playing":case "verifying":text="正在自动通关";break;case "planning_segment":text="正在计算下一小段";break;case "waiting_new_game":text="等待重新开局";break;case "learning":text="正在学习新牌型";break;case "waiting_target":text="等待临时提示消失";break;case "waiting_effect":text="羊群特效遮住了目标";break;case "waiting_manual_move":text="请手动使用一次移出";break;case "paused":text="托管已暂停";break;case "blocked":text="需要处理";break;case "stopped":text="托管已停止";break;case "finished":text="答案已执行完毕";break;case "waiting_board":text="正在等待棋盘或地图更新";break;case "restoring":text="正在恢复设置";break;default:text="正在连接服务";break;}
         var search=D(d,"search");var ps=D(d,"playback");var settings=D(d,"settings");string searchState=V(search,"state");
         bool constraint=V(settings,"solver_engine")=="static_constraint_v1"&&V(d,"rules")=="standard";
         bool original=!constraint&&(V(settings,"solver_engine")=="upstream_normal_snapshot_v1"||V(search,"engine")=="upstream_normal_snapshot_v1");
@@ -225,7 +227,7 @@ sealed class AutoSheepForm : Form {
         bool rolling=!standard&&(V(search,"execution_kind")=="rolling_segment_v1"||V(ps,"execution_kind")=="rolling_segment_v1");
         bool running=B(d,"auto_enabled");
         if(original&&state=="waiting_start"&&!running)text="原版模式已就绪";
-        string mainMessage=state=="playing"||state=="verifying"?"按已验证路线自动点击，每一步都会核对牌面和牌槽。":V(d,"message");
+        string mainMessage=state=="playing"||state=="verifying"?(V(ps,"state")=="full_check"?V(d,"message"):V(ps,"execution_kind")=="manual_move_out_live_v1"?"按道具路线执行，到移出位置暂停；完成手动移出后自动核对并续接。":V(settings,"verification_mode","normal")=="normal"?"按已验证路线自动点击，每一步都会核对牌面和牌槽。":"确认目标牌消失后立即继续，不等待牌槽动画。"):V(d,"message");
         int level=d.ContainsKey("level")&&d["level"]!=null?Convert.ToInt32(d["level"])+1:0;
         string game=V(d,"mode")=="world"?"羊羊大世界":V(d,"mode")=="daily"?"每日一关":"模式待核对";
         string modeText=game+(V(d,"rules")=="color_shuffle"?" · 消除后变色":V(d,"rules")=="energy_alien"?" · 电量与飞碟":"")+" · "+(level>0?"第 "+level+" / "+V(d,"map_count")+" 关":"自动识别关次")+" · "+(running?"托管中":"等待托管");
@@ -244,7 +246,7 @@ sealed class AutoSheepForm : Form {
             else if(searchState=="prop_ready")answerText="道具路线已验证 · 待人工操作";
             else if(searchState=="no_continuation")answerText="模型不可满足 · 范围见下方";
             searchCaption="普通七格牌槽 · 消除后最多6张\n"+V(search,"message","点击开始后求解，完整路线验证后执行");
-            if(searchState=="prop_ready")searchCaption="一次移出完整路线 · "+V(search,"prop_operation_count")+" 个操作\n需人工移出、确认广告结束并校准上方区域\n正常规则是否可解仍未知；当前不会自动点击";
+            if(searchState=="prop_ready")searchCaption="一次移出完整路线 · "+V(search,"prop_operation_count")+" 个操作\n自动执行到移出步骤，手动使用道具并完成广告\n随后核对移出区，自动继续并点回三张牌";
             if(searchState=="searching"){
                 var acceleration=D(search,"acceleration");
                 searchCaption+="\n阶段 "+SearchPhase(V(search,"phase","building"))+" · 已用 "+V(search,"elapsed_seconds","0")+" 秒 / "+V(search,"budget_seconds",V(settings,"seconds"))+" 秒\n"+V(search,"workers","0")+" 路 · "+(acceleration.Count>0?"提示 "+V(acceleration,"hint_cards","0")+" 步 · 已应用 "+V(acceleration,"restored_conflicts","0")+" 条冲突":"变量 "+V(search,"active_variables",V(search,"variables","0")));
@@ -272,7 +274,7 @@ sealed class AutoSheepForm : Form {
         }else searchCaption=state=="waiting_seed"?"种子解出后自动求解，无需手动操作":"答案与棋盘会自动核对，无需手动选择关次";
         int next=Convert.ToInt32(V(ps,"next_step","0")),steps=Convert.ToInt32(V(ps,"total","1")),playMax=steps,playValue=next;
         string stepCaption=ps.Count>0?"已确认 "+next+" / "+steps+" 步 · "+(state=="learning"?"采样新牌型":state=="paused"?"已暂停":state=="blocked"?"已停止，原因见上方":"自动执行并核对"):"执行进度 · 棋盘就绪后自动开始";
-        if(state=="prop_ready")stepCaption="执行未启用 · 返回后核对起点与移出区";
+        if(state=="prop_ready")stepCaption="点击下方主按钮执行，到移出步骤自动暂停";
         if(V(ps,"execution_kind")=="rolling_segment_v1"){
             int count=Convert.ToInt32(V(ps,"board_total","1")),left=Convert.ToInt32(V(ps,"remaining_cards","0"));
             playMax=count;playValue=count-left;stepCaption="已确认 "+next+" 次点击 · 棋盘剩 "+left+" 张";
@@ -284,6 +286,8 @@ sealed class AutoSheepForm : Form {
             state=="paused"||state=="stopped"||state=="disconnected"||state=="connecting"?Ui.Gray:Ui.Blue;
         SetText(title,text);SetText(message,mainMessage);
         var chipList=new List<string>{game};if(level>0)chipList.Add("第 "+level+" / "+V(d,"map_count")+" 关");
+        string verifyMode=V(ps,"verification_mode",V(settings,"verification_mode","normal"));
+        if(verifyMode=="ultra")chipList.Add("超高速");else if(verifyMode=="safe_ultra")chipList.Add("安全超高速 · "+V(ps,"steps_since_full_check","0")+" / "+V(ps,"full_check_interval",V(settings,"full_check_interval","30")));
         if(V(d,"rules")=="color_shuffle")chipList.Add("消除后变色");else if(V(d,"rules")=="energy_alien")chipList.Add("电量与飞碟");
         chipList.Add(constraint||V(search,"engine")=="static_constraint_v1"?"整局约束求解":original?"原版回溯":rolling?"边算边玩":"完整路线");
         if(V(ps,"rules")=="energy_alien_v1")chipList.Add(B(ps,"alien_pending")?"等待飞碟":Convert.ToInt32(V(ps,"alien_activations","0"))>0?"飞碟已召唤":"电量 "+V(ps,"energy_count")+" / "+V(ps,"collect_count"));
@@ -306,7 +310,7 @@ sealed class AutoSheepForm : Form {
         if(ps.Count>0&&state!="solving"&&state!="search_limited"){progress=stepCaption;barMax=playMax;barValue=playValue;percent=(100*Math.Max(0,playValue)/Math.Max(1,playMax))+"%";}
         else if(state=="solving"||searchState=="searching"||state=="planning_segment"){double budgetValue;string budget=double.TryParse(V(search,"budget_seconds",V(settings,"seconds")),out budgetValue)?Math.Round(budgetValue).ToString():"";
             progress="正在计算 · 已用 "+V(search,"elapsed_seconds","0")+" 秒"+(budget!=""?" / "+budget+" 秒":"");barStyle=ProgressBarStyle.Marquee;}
-        else if(state=="prop_ready"){progress="一次移出路线 · "+V(search,"prop_operation_count")+" 个操作，需人工执行";barMax=barValue=1;}
+        else if(state=="prop_ready"){progress="一次移出路线 · "+V(search,"prop_operation_count")+" 个操作，仅使用道具时需手动";barMax=barValue=1;}
         else if(answered){progress="完整路线已验证，等待执行";barMax=barValue=1;}
         else if(state=="search_limited"||searchState=="limited"){progress="本轮预算已用完，未执行任何步骤";}
         else progress="棋盘就绪后自动开始";
@@ -315,15 +319,18 @@ sealed class AutoSheepForm : Form {
 
         // A single primary action that follows the state; stop is secondary.
         string primaryText;bool primaryEnabled=true;primaryAction="start";
-        if(state=="prop_ready"){primaryText="道具路线需人工操作";primaryEnabled=false;}
+        if(state=="prop_ready"){primaryText="执行到手动移出";primaryAction="start_prop";}
+        else if(state=="waiting_manual_move"){primaryText="已完成移出，核对并继续";primaryAction="confirm_move_out";}
         else if(running){primaryText="暂停托管";primaryAction="pause";}
         else if(state=="paused")primaryText="继续托管";
         else primaryText=state=="search_limited"?"重新求解":state=="blocked"||state=="stopped"?"重新核对并继续":B(d,"can_resume")?"从第 "+(next+1)+" 步继续":"开始托管";
-        SetText(primary,primaryText);primary.Enabled=primaryEnabled;primary.Main=!running;
-        stop.Enabled=running||state=="paused"||B(d,"busy");refresh.Enabled=!running&&!B(d,"busy");propGuide.Visible=state=="prop_ready";
+        SetText(primary,primaryText);primary.Enabled=primaryEnabled;primary.Main=!running||state=="waiting_manual_move";
+        stop.Enabled=running||state=="paused"||B(d,"busy");refresh.Enabled=!running&&!B(d,"busy");propGuide.Visible=state=="prop_ready"||state=="waiting_manual_move"||V(ps,"execution_kind")=="manual_move_out_live_v1";
         suppress=true;try{if(settings.Count>0){
             int p=Math.Max(0,Math.Min(2,Convert.ToInt32(V(settings,"performance","2")))),s=Math.Max(0,Math.Min(2,Convert.ToInt32(V(settings,"click_speed","1"))));decimal sec=Math.Max(30,Math.Min(300,Convert.ToDecimal(V(settings,"seconds","180"))));
             if(performance.SelectedIndex!=p)performance.SelectedIndex=p;if(speed.SelectedIndex!=s)speed.SelectedIndex=s;if(seconds.Value!=sec)seconds.Value=sec;
+            string mode=V(settings,"verification_mode","normal");int v=mode=="safe_ultra"?2:mode=="ultra"?1:0;if(verification.SelectedIndex!=v)verification.SelectedIndex=v;
+            decimal interval=Math.Max(1,Math.Min(1000,Convert.ToDecimal(V(settings,"full_check_interval","30"))));if(checkInterval.Value!=interval)checkInterval.Value=interval;
         }}finally{suppress=false;}
         suppress=true;try{
             string[] labels=constraint?new string[]{"整局约束 · 单路","整局约束 · 半数核心","整局约束 · 全部核心"}:original?new string[]{"原版 Python · 单路","原版分支 · 多核","原版分支 · 全速"}:new string[]{"省资源 · 单路","快速 · 自动并行","全速 · 空闲资源"};
@@ -337,19 +344,22 @@ sealed class AutoSheepForm : Form {
     void Event(string text){events.AppendLine(DateTime.Now.ToString("HH:mm:ss")+"  "+text);if(events.Length>30000)events.Remove(0,15000);}
     void OpenPropGuide(){string solution=V(D(snapshot,"search"),"prop_solution_path");if(solution=="")return;string file=Path.Combine(Path.GetDirectoryName(Path.GetFullPath(Path.Combine(root,solution))),"使用移出路线说明.md");if(File.Exists(file))Process.Start(new ProcessStartInfo{FileName=file,UseShellExecute=true});}
     // Settings mirror the hidden controls, which stay the single source sent to the controller.
-    void ShowSettings(){using(var form=new Form{Text="设置",StartPosition=FormStartPosition.CenterParent,Font=Font,BackColor=Ui.Card,FormBorderStyle=FormBorderStyle.FixedDialog,MaximizeBox=false,MinimizeBox=false,ShowInTaskbar=false}){
-        float scale=DeviceDpi/96f;form.ClientSize=new Size((int)(600*scale),(int)(560*scale));
+    void ShowSettings(){using(var form=new Form{Text="设置",AutoScaleMode=AutoScaleMode.None,StartPosition=FormStartPosition.CenterParent,Font=Font,BackColor=Ui.Card,FormBorderStyle=FormBorderStyle.FixedDialog,MaximizeBox=false,MinimizeBox=false,ShowInTaskbar=false}){
+        float scale;using(var graphics=CreateGraphics())scale=Math.Max(1,graphics.DpiX/96f);form.ClientSize=new Size((int)(660*scale),(int)(680*scale));
         var panel=new StableLayout{Dock=DockStyle.Fill,ColumnCount=2,Padding=new Padding(24,20,24,20),BackColor=Ui.Card};panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,110));panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
-        Rows(panel,-30,-40,-40,-40,-22,-30,100,-48);form.Controls.Add(panel);
+        Rows(panel,-30,-40,-40,-40,-40,-40,-48,-30,100,-48);form.Controls.Add(panel);
         var head=TextLabel("托管与求解",11,true);panel.Controls.Add(head,0,0);panel.SetColumnSpan(head,2);
         var speedCopy=new ComboBox{DropDownStyle=ComboBoxStyle.DropDownList,Anchor=AnchorStyles.Left|AnchorStyles.Right};foreach(var item in speed.Items)speedCopy.Items.Add(item);speedCopy.SelectedIndex=speed.SelectedIndex;speedCopy.SelectedIndexChanged+=delegate{speed.SelectedIndex=speedCopy.SelectedIndex;};
         var perfCopy=new ComboBox{DropDownStyle=ComboBoxStyle.DropDownList,Anchor=AnchorStyles.Left|AnchorStyles.Right};foreach(var item in performance.Items)perfCopy.Items.Add(item);perfCopy.SelectedIndex=performance.SelectedIndex;perfCopy.SelectedIndexChanged+=delegate{performance.SelectedIndex=perfCopy.SelectedIndex;};
         var secCopy=new NumericUpDown{Minimum=seconds.Minimum,Maximum=seconds.Maximum,Increment=seconds.Increment,Value=seconds.Value,Anchor=AnchorStyles.Left,Width=(int)(110*scale)};secCopy.ValueChanged+=delegate{seconds.Value=secCopy.Value;};
-        string[] names={"点击速度","求解性能","每轮预算（秒）"};Control[] inputs={speedCopy,perfCopy,secCopy};
-        for(int i=0;i<3;i++){var label=TextLabel(names[i],9.5f);label.ForeColor=muted;panel.Controls.Add(label,0,i+1);panel.Controls.Add(inputs[i],1,i+1);}
-        var logHead=TextLabel("运行记录",11,true);panel.Controls.Add(logHead,0,5);panel.SetColumnSpan(logHead,2);
-        var log=new TextBox{Dock=DockStyle.Fill,Multiline=true,ReadOnly=true,ScrollBars=ScrollBars.Vertical,Text=events.ToString(),BorderStyle=BorderStyle.FixedSingle,BackColor=Ui.Soft,ForeColor=ink,Font=Ui.F(8.75f)};panel.Controls.Add(log,0,6);panel.SetColumnSpan(log,2);
-        var restore=new FlatButton();ButtonStyle(restore,"停止抓取并恢复代理与证书");restore.Margin=new Padding(0,10,0,0);restore.Click+=delegate{Send("restore");form.Close();};panel.Controls.Add(restore,0,7);panel.SetColumnSpan(restore,2);
+        var verificationCopy=new ComboBox{DropDownStyle=ComboBoxStyle.DropDownList,Anchor=AnchorStyles.Left|AnchorStyles.Right,Font=Font};foreach(var item in verification.Items)verificationCopy.Items.Add(item);verificationCopy.SelectedIndex=verification.SelectedIndex;verificationCopy.SelectedIndexChanged+=delegate{verification.SelectedIndex=verificationCopy.SelectedIndex;};
+        var intervalCopy=new NumericUpDown{Minimum=1,Maximum=1000,Value=checkInterval.Value,Anchor=AnchorStyles.Left,Width=(int)(110*scale),Enabled=verificationCopy.SelectedIndex==2};intervalCopy.ValueChanged+=delegate{checkInterval.Value=intervalCopy.Value;};verificationCopy.SelectedIndexChanged+=delegate{intervalCopy.Enabled=verificationCopy.SelectedIndex==2;};
+        string[] names={"点击速度","求解性能","每轮预算（秒）","核对模式","核对间隔（次）"};Control[] inputs={speedCopy,perfCopy,secCopy,verificationCopy,intervalCopy};
+        for(int i=0;i<5;i++){var label=TextLabel(names[i],9.5f);label.ForeColor=muted;panel.Controls.Add(label,0,i+1);panel.Controls.Add(inputs[i],1,i+1);}
+        var hint=TextLabel("超高速不等牌槽动画；安全版按自选间隔自动全盘核对。\n目标无法判定、飞碟和收尾时自动加强核对。",8.5f);hint.ForeColor=muted;panel.Controls.Add(hint,0,6);panel.SetColumnSpan(hint,2);
+        var logHead=TextLabel("运行记录",11,true);panel.Controls.Add(logHead,0,7);panel.SetColumnSpan(logHead,2);
+        var log=new TextBox{Dock=DockStyle.Fill,Multiline=true,ReadOnly=true,ScrollBars=ScrollBars.Vertical,Text=events.ToString(),BorderStyle=BorderStyle.FixedSingle,BackColor=Ui.Soft,ForeColor=ink,Font=Ui.F(8.75f)};panel.Controls.Add(log,0,8);panel.SetColumnSpan(log,2);
+        var restore=new FlatButton();ButtonStyle(restore,"停止抓取并恢复代理与证书");restore.Margin=new Padding(0,10,0,0);restore.Click+=delegate{Send("restore");form.Close();};panel.Controls.Add(restore,0,9);panel.SetColumnSpan(restore,2);
         ScaleTree(panel,scale);form.ShowDialog(this);}}
     async void OnClosing(object sender,FormClosingEventArgs e){if(closeReady)return;e.Cancel=true;if(closing)return;Send("shutdown");closing=true;timer.Stop();Enabled=false;
         await Task.Run(()=>{string lease=Path.Combine(root,"output","workflow","lease.json");for(int i=0;i<180;i++){try{if(!File.Exists(lease))break;var live=Read(lease);if(!B(live,"running"))break;try{if(Process.GetProcessById(Convert.ToInt32(live["pid"])).HasExited)break;}catch(ArgumentException){break;}}catch{}Thread.Sleep(250);}});closeReady=true;Close();}

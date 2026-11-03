@@ -65,7 +65,8 @@ def publish(map_path,data,actions,prefix,folder,origin):
         'moved_types':[by_id[x]['type'] for x in move['side_after']],
         'return_operations':[{'operation':t['operation'],'id':t['id'],'type':t['type']} for t in trace if t['kind']=='return'],
         'normal_solvability':'unknown','rule_assumption':'同型后插入，否则最右；移出最左三张，之后逐张点回；消除后少于七张',
-        'requires':['人工移出并确认广告结束','核对移出前槽内顺序','校准移出区坐标并接入道具执行器'],
+        'prop_desktop_execution_available':True,
+        'requires':['人工移出并确认广告结束','核对移出前槽内顺序','移出区自动识别成功后续接'],
         'source':origin}
     folder.mkdir(parents=True,exist_ok=True)
     atomic_json(folder/'solution.json',payload);atomic_json(folder/'replay_trace.json',trace)
@@ -73,7 +74,7 @@ def publish(map_path,data,actions,prefix,folder,origin):
     for t in trace:
         c=by_id.get(t['id'],{});lines.append('\t'.join(str(x) for x in (t['operation'],t['kind'],t['id'] or '',t['type'] or '',c.get('layer',''),c.get('rolNum',''),c.get('rowNum',''),','.join(t['tray_after']),','.join(t['side_after']))))
     (folder/'route_with_move_out.tsv').write_text('\n'.join(lines)+'\n',encoding='utf-8-sig')
-    (folder/'使用移出路线说明.md').write_text(f"# 一次移出路线已通过两套离线回放\n\n共 {len(trace)} 个操作。正常规则可解性仍为未知。\n\n前 {payload['move_after_board_clicks']} 次棋盘点击后使用移出；此时槽内牌型为 {payload['tray_types_before_move']}，移出牌型为 {payload['moved_types']}。\n\n点回操作：{payload['return_operations']}。\n\n这是道具规划结果，当前执行器不支持自动移出和点回。实际操作前需核对牌槽顺序、完成广告并校准上方区域。\n",encoding='utf-8')
+    (folder/'使用移出路线说明.md').write_text(f"# 一次移出路线已通过两套离线回放\n\n共 {len(trace)} 个操作。正常规则可解性仍为未知。\n\n在助手主界面点击 **执行到手动移出**，程序自动执行前 {payload['move_after_board_clicks']} 次棋盘点击后暂停。\n\n请到游戏里手动使用一次“移出”并完成广告；回到助手点击 **已完成移出，核对并继续**。程序仅在棋盘、牌槽和移出区匹配后继续；剩余棋盘点击和点回操作自动执行。\n\n移出前槽内牌型：{payload['tray_types_before_move']}；移出牌型：{payload['moved_types']}。\n\n点回操作：{payload['return_operations']}。\n\n移出区无法识别或广告未关闭时保持等待，不发送下一次点击。\n",encoding='utf-8')
     return folder/'solution.json',payload
 
 def cached(map_path,data,prefix,folder,legacy=None):

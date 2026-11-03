@@ -30,6 +30,7 @@ static class Native
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr hwnd, ref POINT point);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hwnd, ref POINT point);
+    [DllImport("user32.dll")] public static extern int MapWindowPoints(IntPtr from, IntPtr to, ref POINT point, uint count);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
@@ -106,6 +107,27 @@ static class Native
             var up=new INPUT();up.type=0;up.data.mouse.flags=0x0004;
             if(SendInput(2,new INPUT[]{down,up},Marshal.SizeOf(typeof(INPUT)))!=2) throw new InvalidOperationException("系统没有接受鼠标输入。");
         }
+    }
+    public static bool ClickNormalized(IntPtr hwnd, Point normalized, Size expectedSize)
+    {
+        // Resolve the screenshot point once into client coordinates. Moving a
+        // window after this must not turn an old screen point into a wrong tile.
+        Rectangle visible=Bounds(hwnd);
+        if(visible.Size!=expectedSize)throw new InvalidOperationException("窗口尺寸改变，停止点击并重新核对棋盘");
+        POINT origin=new POINT(0,0);
+        if(!ClientToScreen(hwnd,ref origin))throw new InvalidOperationException("无法读取游戏客户区坐标");
+        POINT point=new POINT(visible.X-origin.X+(int)Math.Round(normalized.X*visible.Width/336.0),
+                              visible.Y-origin.Y+(int)Math.Round(normalized.Y*visible.Height/622.0));
+        if(Bounds(hwnd)!=visible)return false; // Geometry changed during mapping: no input sent.
+        IntPtr target=hwnd;
+        for(int depth=0;depth<12;depth++) {
+            IntPtr child=ChildWindowFromPointEx(target,point,7);
+            if(child==IntPtr.Zero||child==target)break;
+            MapWindowPoints(target,child,ref point,1);target=child;
+        }
+        IntPtr packed=new IntPtr((point.Y<<16)|(point.X&65535));
+        if(!PostMessage(target,0x200,IntPtr.Zero,packed)||!PostMessage(target,0x201,new IntPtr(1),packed)||!PostMessage(target,0x202,IntPtr.Zero,packed))throw new InvalidOperationException("发送后台点击消息失败。");
+        return true;
     }
 }
 
@@ -454,6 +476,38 @@ static class Program
                     using(var changed=(Bitmap)image.Clone())using(var g=Graphics.FromImage(changed)){g.FillRectangle(Brushes.Black,84,207,33,35);if(Vision.PatchDifference(image,changed,new Rectangle(84,207,33,35))<12)throw new Exception("图像变化未被检测");}
                     Console.WriteLine("PASS: reference tile detection, tray recognition and change detection; no input sent.");
                 }return 0;
+            }
+            if(args.Length==2&&args[0]=="--prop-click") {
+                var json=new JavaScriptSerializer();var request=json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Path.GetFullPath(args[1]),Encoding.UTF8));
+                string planPath=Path.GetFullPath(Convert.ToString(request["plan_path"])),folder=Path.GetDirectoryName(planPath);
+                var plan=json.Deserialize<Dictionary<string,object>>(File.ReadAllText(planPath,Encoding.UTF8));
+                if(Convert.ToString(plan["execution_kind"])!="manual_move_out_live_v1")throw new Exception("不是已授权的移出执行计划");
+                var capture=json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Convert.ToString(plan["capture_status_path"]),Encoding.UTF8));
+                var lease=json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Convert.ToString(plan["service_lease_path"]),Encoding.UTF8));
+                if(!Convert.ToBoolean(lease["running"])||!Convert.ToBoolean(capture["complete"])||Convert.ToString(capture["session"])!=Convert.ToString(plan["session"]))throw new Exception("当前局已改变或抓取已停止");
+                string mode=Convert.ToString(capture["source_path"]).Contains("/world/")?"world":"daily";
+                if(mode!=Convert.ToString(plan["mode"]))throw new Exception("道具执行模式已改变");
+                using(var sha=SHA256.Create())if(BitConverter.ToString(sha.ComputeHash(File.ReadAllBytes(Convert.ToString(plan["source_map_path"])))).Replace("-","").ToLowerInvariant()!=Convert.ToString(plan["map_sha256"]))throw new Exception("移出路线地图已改变");
+                var state=json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Path.Combine(folder,"prop_state.json"),Encoding.UTF8));
+                if(!Convert.ToBoolean(state["input_pending"])||Convert.ToInt32(state["next_operation"])!=Convert.ToInt32(request["operation"]))throw new Exception("道具输入没有对应的待确认操作");
+                var prop=json.Deserialize<Dictionary<string,object>>(File.ReadAllText(Convert.ToString(plan["prop_solution_path"]),Encoding.UTF8));
+                if(!Convert.ToBoolean(prop["prop_validated"])||Convert.ToString(prop["map_sha256"])!=Convert.ToString(plan["map_sha256"]))throw new Exception("道具路线未通过回放验收");
+                var actions=((System.Collections.IEnumerable)prop["actions"]).Cast<object>().ToArray();int operation=Convert.ToInt32(request["operation"]);
+                if(operation<0||operation>=actions.Length||Convert.ToString(((Dictionary<string,object>)actions[operation])["kind"])=="move_out")throw new Exception("移出和广告必须由用户手动完成，程序不发送该操作");
+                string receipt=Path.Combine(folder,"prop_click_receipt.json"),id=Convert.ToString(request["id"]);
+                if(File.Exists(receipt)&&Convert.ToString(json.Deserialize<Dictionary<string,object>>(File.ReadAllText(receipt,Encoding.UTF8))["id"])==id)throw new Exception("此操作请求已处理，拒绝重复点击");
+                var values=((System.Collections.IEnumerable)request["point"]).Cast<object>().Select(Convert.ToInt32).ToArray();Point point=new Point(values[0],values[1]);
+                var reserved=((System.Collections.IEnumerable)state["pending_point"]).Cast<object>().Select(Convert.ToInt32).ToArray();if(reserved.Length!=2||reserved[0]!=point.X||reserved[1]!=point.Y)throw new Exception("输入坐标与待确认操作不一致");
+                if(point.X<20||point.X>315||point.Y<118||point.Y>485)throw new Exception("道具点击超出棋盘或移出区");
+                string beforePath=Path.GetFullPath(Convert.ToString(request["before_path"]));
+                if(DateTime.UtcNow-File.GetLastWriteTimeUtc(beforePath)>TimeSpan.FromSeconds(3))throw new Exception("点击核对截图已过期");
+                var windows=Native.FindGame();if(windows.Count!=1)throw new Exception("没有唯一的游戏窗口");
+                using(var beforeImage=new Bitmap(beforePath))using(var currentRaw=Native.Capture(windows[0]))using(var current=Vision.Normalize(currentRaw)) {
+                    if(Vision.PatchDifference(beforeImage,current,new Rectangle(point.X-14,point.Y-14,28,28))>5)throw new Exception("点击前目标变化，未发送道具操作");
+                    File.WriteAllText(receipt,json.Serialize(new Dictionary<string,object>{{"id",id},{"operation",request["operation"]}}),Encoding.UTF8);
+                    if(!Native.ClickNormalized(windows[0],point,Native.Bounds(windows[0]).Size))throw new Exception("窗口移动中，未发送道具操作");
+                }
+                Console.WriteLine("sent");return 0;
             }
             if(args.Length==2&&args[0]=="--capture-to") {
                 var windows=Native.FindGame();if(windows.Count!=1)throw new Exception("没有唯一的游戏窗口");

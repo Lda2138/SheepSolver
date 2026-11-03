@@ -94,18 +94,42 @@ def visual_tray(solution,steps):
     return tray
 
 
-def check_resume_visuals(now,last,solution,plan,n,expected,play,tray_indices=None,allow_new_types=False):
-    """Temporary toasts may vanish: verify every exposed tile and tray icon."""
+def tray_pattern_score(image,point,previous,old_point):
+    """Compare slot icons with a 3x3 low-pass for subpixel redraw differences.
+
+    Keep the strict score gate; only soften antialiased edges, not whole icons.
+    Board geometry, slot count and surviving slot order are checked separately.
+    """
+    import numpy as np
+    def smooth(patch):
+        patch=patch.astype(np.float64)
+        return sum(patch[dy:dy+36,dx:dx+34] for dy in range(3) for dx in range(3))/9
+    x,y=point;old_x,old_y=old_point
+    # The search in pattern_score needs a margin around the slot patch.
+    region=image[y-23:y+24,x-21:x+22]
+    filtered=sum(region[dy:dy+45,dx:dx+41].astype(np.float64) for dy in range(3) for dx in range(3))/9
+    template=smooth(previous[old_y-19:old_y+19,old_x-18:old_x+18])
+    return pattern_score(filtered,(20,22),[template])
+
+
+def type_templates(plan,play):
     import numpy as np
     from PIL import Image
     reference=np.asarray(Image.open(plan['reference_path']).convert('RGB'),dtype=np.int16)
-    image=np.asarray(now,dtype=np.int16);previous=np.asarray(last,dtype=np.int16);templates={}
+    templates={}
     for anchor in plan['anchors']:
         x,y=anchor['center'];templates.setdefault(anchor['type'],[]).append(reference[y-18:y+18,x-17:x+17])
     directory=play/'templates';context=read(directory/'context.json') if (directory/'context.json').exists() else {}
     if context.get('map_sha256')==plan['map_sha256']:
         for file in directory.glob('type_*.png'):
             templates.setdefault(int(file.stem[5:]),[]).append(np.asarray(Image.open(file).convert('RGB'),dtype=np.int16))
+    return templates
+
+
+def check_resume_visuals(now,last,solution,plan,n,expected,play,tray_indices=None,allow_new_types=False):
+    """Temporary toasts may vanish: verify every exposed tile and tray icon."""
+    import numpy as np
+    image=np.asarray(now,dtype=np.int16);previous=np.asarray(last,dtype=np.int16);templates=type_templates(plan,play)
     runtime,_=solution_state(solution,n)
     ids=set(runtime.remaining);remaining=[{**c,'type':runtime.types[c['id']]} for c in solution['cards'] if c['id'] in ids]
     def face(array,point):
@@ -132,9 +156,55 @@ def check_resume_visuals(now,last,solution,plan,n,expected,play,tray_indices=Non
         x,y=43+42*k,511
         if tray_indices is not None and tray_indices[k] is None:continue
         old_x=43+42*(tray_indices[k] if tray_indices is not None else k)
-        if pattern_score(image,(x,y),[previous[y-18:y+18,old_x-17:old_x+17]])>8:raise ValueError('当前牌槽图案与确认记录不一致，无法自动续接')
+        if tray_pattern_score(image,(x,y),previous,(old_x,y))>8:raise ValueError('当前牌槽图案与确认记录不一致，无法自动续接')
     from board_align import check_silhouette
     check_silhouette(play/'resume_check.png',remaining,plan['calibration'])
+
+
+def verify_tray_image(now,expected,templates):
+    from PIL import Image
+    import numpy as np
+    if tray_count(now)!=len(expected):raise ValueError('牌槽数量尚未匹配，等待飞行和三消完成')
+    scaled={}
+    for t,patches in templates.items():
+        scaled[t]=[]
+        for patch in patches:
+            for scale in (1,1.1,1.2,1.3,1.4):
+                w,h=round(34*scale),round(36*scale)
+                im=Image.fromarray(patch.astype(np.uint8)).resize((w,h),Image.Resampling.BICUBIC)
+                scaled[t].append(np.asarray(im.crop(((w-34)//2,(h-36)//2,(w-34)//2+34,(h-36)//2+36)),dtype=np.int16))
+    image=np.asarray(now,dtype=np.int16)
+    for k,t in enumerate(expected):
+        point=(43+42*k,511);score=pattern_score(image,point,scaled.get(t,[]))
+        other=min((pattern_score(image,point,values) for typ,values in scaled.items() if typ!=t),default=1000)
+        if score>75 or other<score+15:raise ValueError(f'第 {k+1} 格牌型尚未匹配')
+
+
+def verify_full_board(play,image_path,n,tray_only=False):
+    """Independent visible-board, silhouette, tray count and tray-type check.
+
+    Uses map-bound templates, not the possibly animating preceding fast frame.
+    No input and no confirmed-action mutation.
+    """
+    from PIL import Image
+    import numpy as np
+    play=Path(play);plan=read(play/'plan.json');solution=read(Path(plan['solution_path']))
+    validate_execution(solution)
+    if solution['map_sha256']!=plan['map_sha256']:raise ValueError('全盘核对：答案与地图不匹配')
+    if not 0<=n<=len(solution['sequence']):raise ValueError('全盘核对步数超出答案范围')
+    now=Image.open(image_path).convert('RGB')
+    if now.size!=(336,622):raise ValueError('全盘核对截图尺寸不一致')
+    expected=visual_tray(solution,n)
+    if tray_count(now)!=len(expected):raise ValueError('全盘核对：牌槽数量尚未匹配')
+    # Each exposed card must match its predicted type and geometry. Do not
+    # accept an unchanged but incorrect frame as the fallback reference.
+    if not tray_only:
+        blank=Image.new('RGB',now.size);now.save(play/'resume_check.png')
+        check_resume_visuals(now,blank,solution,plan,n,[],play,allow_new_types=True)
+    verify_tray_image(now,expected,type_templates(plan,play))
+    runtime,_=solution_state(solution,n)
+    return {'step':n,'exposed_cards_checked':len(exposed([c for c in solution['cards'] if c['id'] in runtime.remaining])),
+            'tray_count':len(expected),'verified':True}
 
 
 def reconcile_pending(folder,level,image_path):
@@ -176,7 +246,16 @@ def reconcile_pending(folder,level,image_path):
     target_delta=float(np.abs(now_array[y-14:y+14,x-14:x+14]-old_array[y-14:y+14,x-14:x+14]).sum(axis=2).mean())
     try:age=(datetime.now(timezone.utc)-datetime.fromisoformat(status['time'])).total_seconds()
     except (ValueError,KeyError):age=0
-    if age>=5 and tray_count(now)==len(before) and board_delta<=2 and tray_delta<=2 and target_delta<=2:
+    fast=status.get('verification_mode') in ('ultra','safe_ultra')
+    no_effect=board_delta<=2 and tray_delta<=2 and target_delta<=2
+    if fast and age>=5 and len(before)!=len(after) and tray_count(now)==len(before):
+        # The last fast frame may still contain tray animation, including the
+        # previous card flying over this target, so no pixel delta against it
+        # is required. A fresh full match of the pre-click state (target card
+        # included) with the pre-click tray count proves the input was lost.
+        try:verify_full_board(play,image_path,n);no_effect=True
+        except ValueError:no_effect=False
+    if age>=5 and tray_count(now)==len(before) and no_effect:
         # A dead sender, a timeout, and an unchanged target/board/tray prove
         # this input did not alter the game. Restore the pre-click boundary;
         # do not advance the confirmed log or count this as a second click.
@@ -185,7 +264,8 @@ def reconcile_pending(folder,level,image_path):
         if sum(item.get('step')==n+1 and item.get('result')=='no_effect' for item in recovered)>=3:
             raise AwaitBoard('waiting_input','同一步后台点击连续未生效，已停止重试；地图与种子已就绪')
         now.save(play/'resume_check.png');now.save(play/f'input_no_effect_{n+1}.png')
-        check_resume_visuals(now,last,solution,plan,n,before,play)
+        if fast:verify_full_board(play,image_path,n)
+        else:check_resume_visuals(now,last,solution,plan,n,shown,play)
         with (play/'input_recovery.jsonl').open('a',encoding='utf-8') as out:
             out.write(json.dumps({'time':datetime.now(timezone.utc).isoformat(),'step':n+1,
                 'card_id':sequence[n],'result':'no_effect','board_delta':board_delta,
@@ -199,7 +279,9 @@ def reconcile_pending(folder,level,image_path):
     x,y=plan['positions'][sequence[n]]
     difference=float(np.abs(np.asarray(now,dtype=np.int16)[y-14:y+14:2,x-14:x+14:2]-np.asarray(last,dtype=np.int16)[y-14:y+14:2,x-14:x+14:2]).sum(axis=2).mean())
     if difference<8:raise ValueError('已发送的点击没有得到牌面变化证据')
-    now.save(play/'resume_check.png');check_resume_visuals(now,last,solution,plan,n+1,shown_after,play,indices,allow_new_types=True)
+    now.save(play/'resume_check.png')
+    if status.get('verification_mode') in ('ultra','safe_ultra'):verify_full_board(play,image_path,n+1)
+    else:check_resume_visuals(now,last,solution,plan,n+1,shown_after,play,indices,allow_new_types=True)
     # The old tray slots have disappeared as expected, every shifted slot and
     # exposed tile matches, and the sole pending target changed. Commit once.
     last.save(play/f'pending_before_{n}.png');now.save(play/f'pending_confirmed_{n+1}.png')
@@ -234,9 +316,11 @@ def checked_resume(folder,level,image_path):
     if now.size!=(336,622) or last.size!=now.size:raise ValueError('棋盘截图尺寸不一致')
     difference=np.abs(np.asarray(now,dtype=np.int16)[118:466:2,25:311:2]-np.asarray(last,dtype=np.int16)[118:466:2,25:311:2]).sum(axis=2).mean()
     if tray_count(now)!=len(expected):raise ValueError('当前牌槽数量与确认记录不一致，无法自动续接')
-    if difference>5:
+    if status.get('verification_mode') in ('ultra','safe_ultra'):
+        verify_full_board(play,image_path,n)
+    elif difference>5:
         check_path=play/'resume_check.png';now.save(check_path)
-        check_resume_visuals(now,last,solution,plan,n,expected,play)
+        check_resume_visuals(now,last,solution,plan,n,visual_tray(solution,n),play)
     return {'level':level,'start_step':n,'total':len(solution['sequence']),'plan':plan,'play':play,
             'rolling':rolling,'segment_end':rolling and n==len(solution['sequence'])}
 
@@ -305,6 +389,13 @@ def inspect_board(folder,image_path,map_count):
     diagnostics=[]
     candidates=fresh_board_candidates(folder,image_path,map_count,diagnostics=diagnostics)
     for level in range(map_count):
+        prop_plan=folder/f'level_{level}_play/plan.json'
+        if prop_plan.exists() and read(prop_plan).get('execution_kind')=='manual_move_out_live_v1':
+            try:
+                import prop_playback
+                return prop_playback.inspect_resume(folder,level,image_path)
+            except (ValueError,OSError,KeyError) as exc:
+                resume_errors.append(str(exc));historical.append(level);continue
         status_path=folder/f'level_{level}_play/playback_status.json'
         if status_path.exists():
             status=read(status_path)
@@ -464,6 +555,10 @@ def prepare_segment(context,folder,mp,data,level,mode,solution_path):
 
 
 def main():
+    if len(sys.argv)>1 and sys.argv[1] in ('verify-playback','verify-tray'):
+        parser=argparse.ArgumentParser();parser.add_argument('action');parser.add_argument('--play',type=Path,required=True)
+        parser.add_argument('--image',type=Path,required=True);parser.add_argument('--step',type=int,required=True)
+        args=parser.parse_args();print(json.dumps(verify_full_board(args.play,args.image,args.step,args.action=='verify-tray'),ensure_ascii=False));return
     p=argparse.ArgumentParser()
     p.add_argument('action',choices=['solve','prepare'])
     p.add_argument('--mode',choices=['daily','world'],required=True)

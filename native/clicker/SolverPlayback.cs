@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using System.Threading.Tasks;
 
 // Separate background player of an independently validated original solver answer.
 static class SolverPlayback
@@ -18,11 +19,65 @@ static class SolverPlayback
     static bool RollingExecution;
     static int BoardTotal;
     static double FaceScaleX=1,FaceScaleY=1;
+    static string VerificationMode="normal";
+    static int StepsSinceFullCheck,LastFullCheckStep,FullCheckInterval=30;
+    static int[][] TrayTrace;
+    internal static int[] PushTray(int[] before,int type){var result=before.ToList();result.Add(type);if(result.Count(t=>t==type)==3)result.RemoveAll(t=>t==type);return result.ToArray();}
+    static bool Ultra {get{return VerificationMode=="ultra"||VerificationMode=="safe_ultra";}}
+    static string Mode(object value){string mode=Convert.ToString(value);return mode=="ultra"||mode=="safe_ultra"?mode:"normal";}
+    internal static bool FullCheckDue(string mode,int steps,int interval){return mode=="safe_ultra"&&steps>=Math.Max(1,Math.Min(1000,interval));}
     static Dictionary<string,object> Read(string p){using(var stream=new FileStream(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete))using(var reader=new StreamReader(stream,Encoding.UTF8))return Json.Deserialize<Dictionary<string,object>>(reader.ReadToEnd());}
     static object[] Items(object v){return ((System.Collections.IEnumerable)v).Cast<object>().ToArray();}
     static Point PointOf(object v){var a=Items(v);return new Point(Convert.ToInt32(a[0]),Convert.ToInt32(a[1]));}
     static bool VerificationMatches(bool last,int observed,int expected,double targetDiff,double trayDiff){return (last||observed==expected)&&(targetDiff>=8||trayDiff>=8);}
+    internal static bool VerificationEvidence(bool localRemoved,bool last,int observed,int expected,double targetDiff,double trayDiff){return localRemoved||VerificationMatches(last,observed,expected,targetDiff,trayDiff);}
     static int VerificationWindow(bool alien,int verifyMs){return alien?10000:Math.Max(3000,verifyMs+1500);}
+    internal static bool FollowWindow(ref Rectangle bounds,Rectangle current) {
+        if(current.Size!=bounds.Size)throw new Exception("窗口尺寸改变，停止点击并重新核对棋盘");
+        bool moved=current.Location!=bounds.Location;bounds=current;return moved;
+    }
+    static bool BoardBackground(Color c){return c.G>180&&c.G>c.R+20&&c.G>c.B+30;}
+    static bool TileSurface(Color c){return c.R>205&&c.G>205&&c.B>145||c.R>=85&&c.R<=215&&c.G>=110&&c.G<=225&&c.B>=50&&c.B<=180&&c.G>=c.R&&c.R>c.B+10&&c.G>c.B+20;}
+    static double NeutralCoverage(Bitmap image,Point p) {
+        int neutral=0,total=0;
+        for(int y=Math.Max(0,p.Y-23);y<=Math.Min(image.Height-1,p.Y+23);y+=3)
+            for(int x=Math.Max(0,p.X-23);x<=Math.Min(image.Width-1,p.X+23);x+=3){Color c=Vision.At(image,x,y);int hi=Math.Max(c.R,Math.Max(c.G,c.B)),lo=Math.Min(c.R,Math.Min(c.G,c.B));if(hi-lo<8&&(c.R>225||c.R<115))neutral++;total++;}
+        return (double)neutral/Math.Max(1,total);
+    }
+    internal static bool AnimationOccluded(Bitmap before,Bitmap after,Point p){double now=NeutralCoverage(after,p);return now>.55&&now-NeutralCoverage(before,p)>.25;}
+    internal static bool NeedsStableFrame(bool localRemoved,bool ultra,bool adaptive,bool alien){return !localRemoved&&(alien||adaptive&&!ultra);}
+    internal static bool TargetDisappeared(Bitmap before,Bitmap after,Point p,Point[] remainingCenters=null) {
+        if(AnimationOccluded(before,after,p))return false;
+        double same=1000;
+        for(int dy=-2;dy<=2;dy++)for(int dx=-2;dx<=2;dx++)same=Math.Min(same,Score(after,new Point(p.X+dx,p.Y+dy),before,p));
+        if(same<=60)return false; // An unchanged icon, including a redraw, is not a click.
+        if(FaceVisible(after,p))return true; // A different underlying face is now exposed.
+        int green=0,total=0;
+        for(int y=-9;y<=9;y+=3)for(int x=-9;x<=9;x+=3){Color c=Vision.At(after,p.X+x,p.Y+y);total++;if(BoardBackground(c))green++;}
+        if(green>=total*.75)return true;
+        if(remainingCenters==null)return false;
+        // Dense world boards commonly expose only part of a still-covered,
+        // dimmed lower card. Check the eight LOCAL frame samples against the
+        // remaining map footprint instead of requiring a complete pale face.
+        int matches=0;
+        foreach(var offset in new[]{new Point(-12,-13),new Point(12,-13),new Point(-12,12),new Point(12,12),new Point(-14,-6),new Point(14,-6),new Point(-14,5),new Point(14,5)}) {
+            Point q=new Point(p.X+(int)Math.Round(offset.X*FaceScaleX),p.Y+(int)Math.Round(offset.Y*FaceScaleY));
+            bool covered=remainingCenters.Any(c=>Math.Abs(c.X-q.X)<16*FaceScaleX&&Math.Abs(c.Y-q.Y)<18*FaceScaleY);
+            Color color=Vision.At(after,q.X,q.Y);if(covered?TileSurface(color):BoardBackground(color))matches++;
+        }
+        return matches>=5;
+    }
+    static string FullCheck(string folder,string image,int step) {
+        string root=AppDomain.CurrentDomain.BaseDirectory;
+        var info=new System.Diagnostics.ProcessStartInfo{FileName=Path.Combine(root,"venv","Scripts","python.exe"),
+            Arguments="\""+Path.Combine(root,"app_bridge.py")+"\" verify-playback --play \""+folder+"\" --image \""+image+"\" --step "+step,
+            WorkingDirectory=root,UseShellExecute=false,CreateNoWindow=true,RedirectStandardError=true,RedirectStandardOutput=true};
+        using(var process=System.Diagnostics.Process.Start(info)) {
+            var error=process.StandardError.ReadToEndAsync();var output=process.StandardOutput.ReadToEndAsync();
+            if(!process.WaitForExit(8000)){process.Kill();return "全盘核对超时";}
+            Task.WaitAll(error,output);return process.ExitCode==0?null:error.Result.Trim();
+        }
+    }
     static bool FaceVisible(Bitmap image,Point p){int pale=0;foreach(var offset in new[]{new Point(-12,-13),new Point(12,-13),new Point(-12,12),new Point(12,12),new Point(-14,-6),new Point(14,-6),new Point(-14,5),new Point(14,5)}){Color c=Vision.At(image,p.X+(int)Math.Round(offset.X*FaceScaleX),p.Y+(int)Math.Round(offset.Y*FaceScaleY));if(c.R>205&&c.G>205&&c.B>145)pale++;}return pale>=5;}
     static bool EnergyFaceVisible(Bitmap image,Point p){
         int yellow=0,outline=0;
@@ -53,6 +108,8 @@ static class SolverPlayback
     }
     static void SaveStatus(string folder,int next,int total,List<int> tray,string state,string message) {
         var payload=new Dictionary<string,object>{{"pid",System.Diagnostics.Process.GetCurrentProcess().Id},{"input_pending",UnverifiedInput},{"next_step",next},{"total",total},{"expected_tray",tray.ToArray()},{"state",state},{"message",message},{"time",DateTimeOffset.Now.ToString("o")}};
+        payload["verification_mode"]=VerificationMode;payload["steps_since_full_check"]=StepsSinceFullCheck;payload["last_full_check_step"]=LastFullCheckStep;payload["full_check_interval"]=FullCheckInterval;
+        if(TrayTrace!=null&&next<TrayTrace.Length){payload["confirmed_tray"]=TrayTrace[next];payload["confirmed_tray_count"]=TrayTrace[next].Length;payload["predicted_tray_count"]=tray.Count;}
         if(EnergyTrace!=null){payload["rules"]="energy_alien_v1";payload["energy_count"]=next>0?EnergyTrace[next-1].Collected:0;payload["collect_count"]=EnergyThreshold;payload["alien_activations"]=EnergyTrace.Take(next).Count(e=>e.Alien);payload["alien_pending"]=UnverifiedInput&&next<EnergyTrace.Length&&EnergyTrace[next].Alien;}
         if(RollingExecution){payload["execution_kind"]="rolling_segment_v1";payload["board_total"]=BoardTotal;payload["remaining_cards"]=BoardTotal-next-(EnergyTrace==null?0:EnergyTrace.Take(next).Sum(e=>e.AutoRemoved.Length));payload["segment_end_step"]=total;}
         string path=Path.Combine(folder,"playback_status.json"),temp=path+".tmp";File.WriteAllText(temp,Json.Serialize(payload),Encoding.UTF8);for(int attempt=0;attempt<8;attempt++)try{if(File.Exists(path))File.Replace(temp,path,null);else File.Move(temp,path);return;}catch(IOException){System.Threading.Thread.Sleep(15);}
@@ -67,6 +124,35 @@ static class SolverPlayback
     [STAThread] static int Main(string[] args) {
         Console.OutputEncoding=Encoding.UTF8;Native.SetProcessDPIAware();Application.EnableVisualStyles();
         try {
+            if(args.Length==5&&args[0]=="--check-animation-occlusion") {
+                using(var oldFrame=new Bitmap(args[1]))using(var newFrame=new Bitmap(args[2])) {
+                    Point point=new Point(int.Parse(args[3]),int.Parse(args[4]));
+                    if(!AnimationOccluded(oldFrame,newFrame,point)||TargetDisappeared(oldFrame,newFrame,point))throw new Exception("Opaque animation accepted as target removal");
+                }
+                Console.WriteLine("PASS: captured sheep animation blocks target confirmation; no input");return 0;
+            }
+            if(args.Length==1&&args[0]=="--check-ultra") {
+                Rectangle testBounds=new Rectangle(50,80,336,622);
+                if(!FollowWindow(ref testBounds,new Rectangle(-600,200,336,622))||testBounds.X!=-600||FollowWindow(ref testBounds,testBounds))throw new Exception("Window translation failed");
+                bool resized=false;try{FollowWindow(ref testBounds,new Rectangle(-600,200,400,622));}catch(Exception){resized=true;}if(!resized)throw new Exception("Resize accepted");
+                foreach(int interval in new[]{1,7,30,1000})if(FullCheckDue("safe_ultra",interval-1,interval)||!FullCheckDue("safe_ultra",interval,interval)||FullCheckDue("ultra",interval,interval)||FullCheckDue("normal",interval,interval))throw new Exception("Checkpoint interval failed");
+                if(!VerificationEvidence(false,false,2,2,30,20)||VerificationEvidence(false,false,1,2,30,20)||VerificationEvidence(false,false,2,2,0,0)||!VerificationEvidence(true,false,-1,2,30,0))throw new Exception("Immediate local/tray evidence gate failed");
+                if(NeedsStableFrame(false,true,true,false)||!NeedsStableFrame(false,false,true,false)||!NeedsStableFrame(false,true,true,true)||NeedsStableFrame(true,true,true,false))throw new Exception("Ultra fallback still waits for animation stability");
+                int[] replay=new int[0];foreach(int type in new[]{1,2,3,1,1,2,2,3,3})replay=PushTray(replay,type);if(replay.Length!=0||!PushTray(new[]{1,1,2,3,4,5},1).SequenceEqual(new[]{2,3,4,5}))throw new Exception("Triple replay count failed");
+                using(var testBefore=new Bitmap(336,622)) {
+                    using(var g=Graphics.FromImage(testBefore)){g.Clear(Color.FromArgb(193,255,137));g.FillRectangle(Brushes.Beige,133,217,34,36);g.FillEllipse(Brushes.DarkBlue,140,224,21,22);}
+                    Point p=new Point(150,235);
+                    using(var after=new Bitmap(testBefore))if(TargetDisappeared(testBefore,after,p))throw new Exception("Unchanged tile accepted");
+                    using(var after=new Bitmap(testBefore)){using(var g=Graphics.FromImage(after))g.FillRectangle(Brushes.Black,130,214,40,42);if(TargetDisappeared(testBefore,after,p))throw new Exception("Opaque overlay accepted");}
+                    using(var after=new Bitmap(testBefore)){using(var g=Graphics.FromImage(after))g.FillRectangle(new SolidBrush(Color.FromArgb(193,255,137)),130,214,40,42);if(!TargetDisappeared(testBefore,after,p))throw new Exception("Removed target rejected");}
+                    using(var after=new Bitmap(testBefore)){using(var g=Graphics.FromImage(after)){g.FillRectangle(Brushes.Beige,133,217,34,36);g.FillEllipse(Brushes.Red,140,224,21,22);}if(!TargetDisappeared(testBefore,after,p))throw new Exception("Uncovered different tile rejected");}
+                    using(var after=new Bitmap(testBefore)) {
+                        using(var g=Graphics.FromImage(after)){g.Clear(Color.FromArgb(193,255,137));using(var gray=new SolidBrush(Color.FromArgb(133,155,92)))g.FillRectangle(gray,133,200,34,36);}
+                        if(TargetDisappeared(testBefore,after,p)||!TargetDisappeared(testBefore,after,p,new[]{new Point(150,218)})||TargetDisappeared(testBefore,after,p,new Point[0]))throw new Exception("Covered lower tile geometry gate failed");
+                    }
+                }
+                Console.WriteLine("PASS: translation follows, resize blocked; selectable checkpoint intervals; unchanged/obscured target blocked, removal accepted; no input");return 0;
+            }
             if(args.Length==2&&args[0]=="--check-learning"){
                 var testPlan=Read(args[1]);CheckSession(testPlan);var answer=Read((string)testPlan["solution_path"]);var cs=Items(answer["cards"]).Select(o=>(Dictionary<string,object>)o).ToDictionary(c=>(string)c["id"]);var seq=Items(answer["sequence"]).Select(Convert.ToString).ToArray();int start=Convert.ToInt32(testPlan["start_step"]);var ids=new HashSet<string>(seq.Skip(start));Point p=PointOf(((Dictionary<string,object>)testPlan["positions"])[seq[start]]);
                 using(var source=new Bitmap((string)testPlan["initial_reference_path"]))using(var im=Vision.Normalize(source))using(var missing=new Bitmap(im)){
@@ -99,6 +185,8 @@ static class SolverPlayback
             if(args.Length<1)throw new Exception("Usage: SolverPlayback.exe plan.json [limit]");
             string planPath=Path.GetFullPath(args[0]),folder=Path.GetDirectoryName(planPath);
             var plan=Read(planPath);var solution=Read((string)plan["solution_path"]);
+            VerificationMode=Mode(plan.ContainsKey("verification_mode")?plan["verification_mode"]:null);
+            if(plan.ContainsKey("full_check_interval"))FullCheckInterval=Math.Max(1,Math.Min(1000,Convert.ToInt32(plan["full_check_interval"])));
             if(plan.ContainsKey("calibration")){
                 var calibration=(Dictionary<string,object>)plan["calibration"];
                 if(calibration.ContainsKey("face_scale_x"))FaceScaleX=Convert.ToDouble(calibration["face_scale_x"]);
@@ -131,12 +219,13 @@ static class SolverPlayback
             if(energyMode&&energyFacts.Length!=sequence.Length)throw new Exception("Incomplete energy event trace");
             var colorRuntime=energyMode?new ColorRules{Types=cardArray.Select(c=>Convert.ToInt32(c["type"])).ToArray(),Special=new int[0]}:ColorRules.FromSolution(solution,cardArray);var colorPicked=new bool[cardArray.Length];
             var sequenceTypes=new int[sequence.Length];int replayStep=0;
-            var remaining=new HashSet<string>(cards.Keys);var simulated=new List<int>();
+            var remaining=new HashSet<string>(cards.Keys);var simulated=new List<int>();var trayTrace=new List<int[]>{new int[0]};
             foreach(string id in sequence) {
                 if(!remaining.Contains(id))throw new Exception("重复或未知牌编号");var c=cards[id];
                 if(remaining.Any(other=>Convert.ToInt32(cards[other]["layer"])>Convert.ToInt32(c["layer"])&&Math.Abs(Convert.ToInt32(cards[other]["rolNum"])-Convert.ToInt32(c["rolNum"]))<8&&Math.Abs(Convert.ToInt32(cards[other]["rowNum"])-Convert.ToInt32(c["rowNum"]))<8))throw new Exception("答案点击了被遮挡的牌");
-                int t=colorRuntime.Types[indices[id]];sequenceTypes[replayStep]=t;simulated.Add(t);bool crush=simulated.Count(x=>x==t)==3;if(crush)simulated.RemoveAll(x=>x==t);
+                int t=colorRuntime.Types[indices[id]];sequenceTypes[replayStep]=t;bool crush=simulated.Count(x=>x==t)==2;simulated=PushTray(simulated.ToArray(),t).ToList();
                 if(energyMode){var ev=energyRuntime.Step(id);energyRuntime.Check(ev,energyFacts[replayStep],id);energySteps[replayStep]=ev;simulated=ev.Tray.ToList();foreach(string auto in ev.AutoRemoved)remaining.Remove(auto);}
+                trayTrace.Add(simulated.ToArray());
                 replayStep++;
                 colorPicked[indices[id]]=true;if(crush&&colorRuntime.Enabled)colorRuntime.Shuffle(colorPicked);
                 if(simulated.Count>=7)throw new Exception("答案会填满牌槽");remaining.Remove(id);Point p=PointOf(positions[id]);
@@ -147,19 +236,23 @@ static class SolverPlayback
             if(!rollingMode&&!boardCleared)throw new Exception("答案不完整");
             if(rollingMode&&(Convert.ToBoolean(solution["complete"])!=boardCleared||Convert.ToInt32(solution["remaining_count"])!=remaining.Count||!Items(solution["expected_tray"]).Select(Convert.ToInt32).SequenceEqual(simulated)))throw new Exception("分段终点状态不一致");
             if(rollingMode)RollingState.CheckLookahead(solution);
-            EnergyTrace=energySteps;if(energyMode)EnergyThreshold=Convert.ToInt32(((Dictionary<string,object>)solution["rules"])["collect_count"]);
+            TrayTrace=trayTrace.ToArray();EnergyTrace=energySteps;if(energyMode)EnergyThreshold=Convert.ToInt32(((Dictionary<string,object>)solution["rules"])["collect_count"]);
             RollingExecution=rollingMode;BoardTotal=cards.Count;
+            if(args.Length>1&&args[1]=="--dump-tray-trace"){Console.WriteLine(Json.Serialize(TrayTrace));return 0;}
             if(args.Length>1&&args[1]=="--validate-only"){Console.WriteLine(rollingMode?"PASS: rolling segment coverage, seeded rules and tray replay; no input":"PASS: complete coverage, seeded colors and seven-slot replay; no input");return 0;}
             int limit=args.Length>1?int.Parse(args[1]):sequence.Length;
             var windows=Native.FindGame();if(windows.Count!=1)throw new Exception("未找到唯一的羊了个羊窗口");IntPtr game=windows[0];Rectangle bounds=Native.Bounds(game);
-            int markMs=plan.ContainsKey("mark_milliseconds")?Math.Max(60,Math.Min(5000,Convert.ToInt32(plan["mark_milliseconds"]))):450;
-            int verifyMs=plan.ContainsKey("verify_milliseconds")?Math.Max(200,Math.Min(5000,Convert.ToInt32(plan["verify_milliseconds"]))):1000;
+            int markMs=plan.ContainsKey("mark_milliseconds")?Math.Max(Ultra?0:60,Math.Min(5000,Convert.ToInt32(plan["mark_milliseconds"]))):450;
+            int verifyMs=plan.ContainsKey("verify_milliseconds")?Math.Max(Ultra?20:200,Math.Min(5000,Convert.ToInt32(plan["verify_milliseconds"]))):1000;
             bool adaptive=plan.ContainsKey("adaptive_verify")&&Convert.ToBoolean(plan["adaptive_verify"]);DateTime verifyDeadline=DateTime.MinValue,targetDeadline=DateTime.MinValue;Bitmap settledFrame=null;
             string lastCommand="";
             var tray=new List<int>();bool colorCrushed=false;int next=plan.ContainsKey("start_step")?Convert.ToInt32(plan["start_step"]):0,result=0,stage=0;bool stopRequested=false;bool paused=false,oldPause=false;string reason="";Bitmap before=null;Point target=Point.Empty;
             if(next<0||next>=sequence.Length)throw new Exception("恢复步数无效");
-            for(int i=0;i<next;i++){int t=sequenceTypes[i];tray.Add(t);if(tray.Count(x=>x==t)==3)tray.RemoveAll(x=>x==t);if(energyMode)tray=energySteps[i].Tray.ToList();}
+            tray=TrayTrace[next].ToList();
             var activeRemaining=new HashSet<string>(cards.Keys);for(int i=0;i<next;i++){activeRemaining.Remove(sequence[i]);if(energyMode)foreach(string auto in energySteps[i].AutoRemoved)activeRemaining.Remove(auto);}
+            LastFullCheckStep=next;StepsSinceFullCheck=0;
+            bool inputUltra=false,effectSampleSaved=false;DateTime inputSentAt=DateTime.MinValue,fullDeadline=DateTime.MinValue,settleDeadline=DateTime.MinValue;Point[] localRemaining=null;
+            Task<string> fullTask=null;Bitmap fullFrame=null;string fullError="";
             bool dynamic=plan.ContainsKey("dynamic_anchors")&&Convert.ToBoolean(plan["dynamic_anchors"]);Bitmap learningFrame=null;DateTime learningDeadline=DateTime.MinValue;
             using(var original=new Bitmap((string)plan["reference_path"]))using(var reference=Vision.Normalize(original))using(var overlay=new Overlay())using(var timer=new Timer()) {
                 using(var raw=Native.Capture(game))using(var now=Vision.Normalize(raw)) {
@@ -168,7 +261,7 @@ static class SolverPlayback
                         if(Vision.PatchDifference(initial,now,new Rectangle(25,118,286,347))>5)throw new Exception("棋盘与坐标校准截图不一致");
                 }
                 DateTime due=DateTime.UtcNow;
-                timer.Interval=50;
+                timer.Interval=Ultra?20:50;
                 timer.Tick+=delegate {
                     try {
                         string controlPath=Path.Combine(folder,"control.json");
@@ -177,7 +270,12 @@ static class SolverPlayback
                                 var command=Read(controlPath);string id=Convert.ToString(command["id"]);
                                 if(id!=lastCommand){lastCommand=id;string action=Convert.ToString(command["action"]);
                                     if(action=="stop"){if(!UnverifiedInput)throw new OperationCanceledException("用户停止点击");stopRequested=true;}
-                                    if(action=="speed"){markMs=Math.Max(60,Math.Min(5000,Convert.ToInt32(command["mark_milliseconds"])));verifyMs=Math.Max(200,Math.Min(5000,Convert.ToInt32(command["verify_milliseconds"])));}
+                                    if(action=="speed"){
+                                        string mode=Mode(command.ContainsKey("verification_mode")?command["verification_mode"]:VerificationMode);
+                                        VerificationMode=mode;
+                                        if(command.ContainsKey("full_check_interval"))FullCheckInterval=Math.Max(1,Math.Min(1000,Convert.ToInt32(command["full_check_interval"])));
+                                        markMs=Math.Max(Ultra?0:60,Math.Min(5000,Convert.ToInt32(command["mark_milliseconds"])));verifyMs=Math.Max(Ultra?20:200,Math.Min(5000,Convert.ToInt32(command["verify_milliseconds"])));timer.Interval=Ultra?20:50;
+                                    }
                                     if(action=="pause"||action=="resume"){paused=action=="pause";if(!paused&&stage==2)verifyDeadline=DateTime.UtcNow.AddMilliseconds(VerificationWindow(energyMode&&energySteps[next].Alien,verifyMs));overlay.Hide();SaveStatus(folder,next,sequence.Length,tray,paused?"paused":"running",paused?"已暂停":"继续执行");}
                                 }
                             }catch(IOException){}catch(ArgumentException){}
@@ -187,15 +285,64 @@ static class SolverPlayback
                         if(key&&!oldPause){paused=!paused;if(!paused&&stage==2)verifyDeadline=DateTime.UtcNow.AddMilliseconds(VerificationWindow(energyMode&&energySteps[next].Alien,verifyMs));SaveStatus(folder,next,sequence.Length,tray,paused?"paused":"running","F8");overlay.Hide();}oldPause=key;
                         if(paused||DateTime.UtcNow<due)return;
                         CheckSession(plan);
-                        if(Native.Bounds(game)!=bounds)throw new Exception("窗口位置或尺寸改变，停止点击");
+                        if(FollowWindow(ref bounds,Native.Bounds(game))) {
+                            overlay.Hide();
+                            // A sent click still needs verification; never replay it
+                            // just because the containing window moved. Before sending,
+                            // restart target checks after a short quiet interval.
+                            if(!UnverifiedInput&&stage!=4){stage=0;targetDeadline=DateTime.MinValue;if(learningFrame!=null){learningFrame.Dispose();learningFrame=null;}}
+                            else verifyDeadline=DateTime.UtcNow.AddMilliseconds(VerificationWindow(energyMode&&energySteps[next].Alien,verifyMs));
+                            due=DateTime.UtcNow.AddMilliseconds(180);return;
+                        }
+                        if(stage==4) {
+                            if(fullTask!=null) {
+                                if(!fullTask.IsCompleted)return;
+                                fullError=fullTask.Result;fullTask=null;
+                                if(fullError==null){
+                                    File.Copy(Path.Combine(folder,"full_check_frame.png"),Path.Combine(folder,"last_verified.png"),true);
+                                    LastFullCheckStep=next;StepsSinceFullCheck=0;
+                                    fullDeadline=DateTime.MinValue;targetDeadline=DateTime.MinValue;stage=0;
+                                    File.AppendAllText(Path.Combine(folder,"full_checks.jsonl"),Json.Serialize(new Dictionary<string,object>{{"step",next},{"verified",true},{"interval",FullCheckInterval},{"time",DateTimeOffset.Now.ToString("o")}})+Environment.NewLine,Encoding.UTF8);
+                                    SaveStatus(folder,next,sequence.Length,tray,"running","全盘核对通过，继续执行");return;
+                                }
+                            }
+                            if(DateTime.UtcNow>fullDeadline)throw new Exception("全盘自动核对未通过，已停止后续点击；"+fullError);
+                            using(var raw=Native.Capture(game))using(var frame=Vision.Normalize(raw)) {
+                                bool stable=fullFrame!=null&&Vision.PatchDifference(fullFrame,frame,new Rectangle(20,118,296,415))<3;
+                                if(fullFrame!=null)fullFrame.Dispose();fullFrame=new Bitmap(frame);
+                                if(!stable){due=DateTime.UtcNow.AddMilliseconds(100);return;}
+                                string checkImage=Path.Combine(folder,"full_check_frame.png");frame.Save(checkImage,ImageFormat.Png);
+                                int checkStep=next;fullTask=Task.Run(()=>FullCheck(folder,checkImage,checkStep));
+                            }
+                            due=DateTime.UtcNow.AddMilliseconds(100);return;
+                        }
                         if(stage==0||stage==3) {
                             if(targetDeadline==DateTime.MinValue)targetDeadline=DateTime.UtcNow.AddSeconds(6);
                             if(next>=sequence.Length||next>=limit){reason=next==sequence.Length?(rollingMode&&!boardCleared?"本段已确认，继续计算下一段":"完整答案已执行；请核对游戏结算"):"达到本次步数上限";timer.Stop();overlay.Close();Application.ExitThread();return;}
+                            bool fullDue=FullCheckDue(VerificationMode,StepsSinceFullCheck,FullCheckInterval);
+                            if(stage==0&&fullDue) {
+                                overlay.Hide();stage=4;fullDeadline=DateTime.UtcNow.AddSeconds(10);fullError="画面尚未稳定";if(fullFrame!=null){fullFrame.Dispose();fullFrame=null;}
+                                SaveStatus(folder,next,sequence.Length,tray,"full_check","正在自动全盘核对：可见牌面、地图轮廓与牌槽");return;
+                            }
                             target=PointOf(positions[sequence[next]]);int type=sequenceTypes[next];
                             if(before!=null){before.Dispose();before=null;}using(var raw=Native.Capture(game))before=Vision.Normalize(raw);
                             using(var norm=Vision.Normalize(before)) {
-                                if(TrayCount(norm)!=tray.Count)throw new Exception("实际牌槽数量与答案状态不一致");
+                                if(!Ultra&&TrayCount(norm)!=tray.Count)throw new Exception("实际牌槽数量与答案状态不一致");
                                 if(!Exposed(sequence[next],cards,activeRemaining))throw new Exception("当前目标仍被遮挡，停止点击");
+                                // The game drops clicks sent while a triple is still
+                                // clearing (step 144 of 20261103T085326Z). After a
+                                // clearing step wait until the drawn tray shows the
+                                // logical count; on timeout continue unchanged.
+                                if(Ultra&&next>0&&TrayTrace[next].Length<TrayTrace[next-1].Length) {
+                                    if(settleDeadline==DateTime.MinValue)settleDeadline=DateTime.UtcNow.AddMilliseconds(1500);
+                                    int seen=-1;try{seen=TrayCount(norm);}catch(Exception){}
+                                    if(seen!=tray.Count&&DateTime.UtcNow<settleDeadline){due=DateTime.UtcNow.AddMilliseconds(30);return;}
+                                }
+                                if(Ultra&&AnimationOccluded(reference,norm,target)) {
+                                    if(!effectSampleSaved){norm.Save(Path.Combine(folder,"effect_obscured.png"),ImageFormat.Png);effectSampleSaved=true;}
+                                    if(DateTime.UtcNow<targetDeadline){due=DateTime.UtcNow.AddMilliseconds(80);SaveStatus(folder,next,sequence.Length,tray,"waiting_effect","羊群特效遮挡目标；关闭游戏设置中的“消除效果”可避免等待");return;}
+                                    throw new Exception("游戏消除特效持续遮挡目标；请关闭游戏设置中的“消除效果”后继续");
+                                }
                                 bool energyTarget=energyMode&&type==Convert.ToInt32(((Dictionary<string,object>)solution["rules"])["gold_type"]);
                                 bool face=FaceVisible(norm,target)||(energyTarget&&EnergyFaceVisible(norm,target));
                                 bool known=anchors.Any(a=>Convert.ToInt32(a["type"])==type)||learned.ContainsKey(type);
@@ -236,10 +383,11 @@ static class SolverPlayback
                         }
                         if(stage==1) {
                             overlay.Hide();using(var current=Native.Capture(game))if(Vision.PatchDifference(before,current,new Rectangle(target.X-13,target.Y-13,26,26))>8){if(dynamic&&DateTime.UtcNow<targetDeadline){stage=0;due=DateTime.UtcNow.AddMilliseconds(180);SaveStatus(folder,next,sequence.Length,tray,"waiting_target","点击前出现动画，重新核对目标");return;}throw new Exception("点击前目标已变化");}
-                            Native.Click(game,new Point(bounds.X+(int)Math.Round(target.X*bounds.Width/336.0),bounds.Y+(int)Math.Round(target.Y*bounds.Height/622.0)),true);
+                            if(!Native.ClickNormalized(game,target,bounds.Size)){stage=0;due=DateTime.UtcNow.AddMilliseconds(180);return;}
                             UnverifiedInput=true;
-                            int type=sequenceTypes[next];tray.Add(type);colorCrushed=tray.Count(x=>x==type)==3;if(colorCrushed)tray.RemoveAll(x=>x==type);
-                            if(energyMode)tray=energySteps[next].Tray.ToList();
+                            inputUltra=Ultra;inputSentAt=DateTime.UtcNow;
+                            localRemaining=activeRemaining.Where(id=>id!=sequence[next]&&(!energyMode||!energySteps[next].AutoRemoved.Contains(id))).Select(id=>PointOf(positions[id])).ToArray();
+                            colorCrushed=TrayTrace[next+1].Length<TrayTrace[next].Length;tray=TrayTrace[next+1].ToList();
                             SaveStatus(folder,next,sequence.Length,tray,"input_sent",sequence[next]);
                             bool alienWait=energyMode&&energySteps[next].Alien;
                             stage=2;due=DateTime.UtcNow.AddMilliseconds(alienWait?Math.Max(3000,verifyMs):verifyMs);verifyDeadline=DateTime.UtcNow.AddMilliseconds(VerificationWindow(alienWait,verifyMs));
@@ -250,29 +398,42 @@ static class SolverPlayback
                             double targetDiff=Vision.PatchDifference(before,norm,new Rectangle(target.X-14,target.Y-14,28,28));
                             double trayDiff=Vision.PatchDifference(before,norm,new Rectangle(22,493,286,40));
                             // Last click may transition immediately to the next level or settlement.
-                            int observed=-1;try{observed=TrayCount(norm);}catch(Exception){if(!adaptive)throw;}
-                            bool matched=VerificationMatches(next==sequence.Length-1&&boardCleared,observed,tray.Count,targetDiff,trayDiff);
                             bool alienVerify=energyMode&&energySteps[next].Alien;
-                            bool stable=!(adaptive||alienVerify)||(settledFrame!=null&&Vision.PatchDifference(settledFrame,after,alienVerify?new Rectangle(10,120,316,415):new Rectangle(22,493,286,40))<3);
+                            bool finalVerify=next==sequence.Length-1&&boardCleared;
+                            if(inputUltra&&!alienVerify&&!(next==sequence.Length-1&&boardCleared)&&AnimationOccluded(before,norm,target)) {
+                                if(!effectSampleSaved){norm.Save(Path.Combine(folder,"effect_obscured.png"),ImageFormat.Png);effectSampleSaved=true;}
+                                if(DateTime.UtcNow<verifyDeadline){due=DateTime.UtcNow.AddMilliseconds(50);SaveStatus(folder,next,sequence.Length,tray,"waiting_effect","羊群特效挡住了点击结果；等待特效离开，建议关闭游戏内“消除效果”");return;}
+                                throw new Exception("游戏消除特效遮挡点击结果，尚未确认；请关闭游戏内“消除效果”后继续核对");
+                            }
+                            bool localOnly=inputUltra&&!alienVerify&&!(next==sequence.Length-1&&boardCleared)&&TargetDisappeared(before,norm,target,localRemaining);
+                            // Ambiguous identical/overlapping faces get a tray check NOW,
+                            // in parallel with local evidence, never after a fixed 900 ms.
+                            int observed=-1;if(!localOnly)try{observed=TrayCount(norm);}catch(Exception){if(!adaptive&&!inputUltra)throw;}
+                            bool matched=VerificationEvidence(localOnly,next==sequence.Length-1&&boardCleared,observed,tray.Count,targetDiff,trayDiff);
+                            bool stable=!NeedsStableFrame(localOnly,inputUltra,adaptive,alienVerify||finalVerify)||(settledFrame!=null&&Vision.PatchDifference(settledFrame,after,alienVerify?new Rectangle(10,120,316,415):new Rectangle(22,493,286,40))<3);
                             if(!matched||!stable){
                                 if(settledFrame!=null){settledFrame.Dispose();settledFrame=null;}
                                 if(matched)settledFrame=new Bitmap(after);
-                                if((adaptive||alienVerify)&&DateTime.UtcNow<verifyDeadline){due=DateTime.UtcNow.AddMilliseconds(80);return;}
+                                if((adaptive||alienVerify||inputUltra)&&DateTime.UtcNow<verifyDeadline){due=DateTime.UtcNow.AddMilliseconds(inputUltra?20:80);return;}
+                                norm.Save(Path.Combine(folder,"verification_timeout.png"),ImageFormat.Png);before.Save(Path.Combine(folder,"verification_before_timeout.png"),ImageFormat.Png);
                                 throw new Exception("点击后牌面/牌槽未稳定或与答案不一致，停止；observed="+observed+" expected="+tray.Count);
                             }
                             if(settledFrame!=null){settledFrame.Dispose();settledFrame=null;}
                             norm.Save(Path.Combine(folder,"last_verified.png"),ImageFormat.Png);
                             var action=new Dictionary<string,object>{{"step",next+1},{"card_id",sequence[next]},{"type",sequenceTypes[next]},{"center",new int[]{target.X,target.Y}},{"tray_count",tray.Count},{"target_difference",Math.Round(targetDiff,2)},{"tray_difference",Math.Round(trayDiff,2)},{"time",DateTimeOffset.Now.ToString("o")},{"mode","background"}};
+                            action["verification"]=localOnly?"target_disappeared":inputUltra&&!alienVerify&&!finalVerify?"target_and_tray_without_stability":"stable_tray_and_target";action["verification_mode"]=VerificationMode;
+                            action["confirmation_ms"]=Math.Round((DateTime.UtcNow-inputSentAt).TotalMilliseconds,1);
+                            action["observed_tray_count"]=observed>=0?(object)observed:null;action["logical_tray_count"]=TrayTrace[next+1].Length;
                             if(energyMode){action["energy_count"]=energySteps[next].Collected;action["alien"]=energySteps[next].Alien;action["auto_removed"]=energySteps[next].AutoRemoved;}
                             File.AppendAllText(Path.Combine(folder,"actions.jsonl"),Json.Serialize(action)+Environment.NewLine,Encoding.UTF8);Console.WriteLine(Json.Serialize(action));
                             UnverifiedInput=false;
                         }
-                        before.Dispose();before=null;activeRemaining.Remove(sequence[next]);if(energyMode)foreach(string auto in energySteps[next].AutoRemoved)activeRemaining.Remove(auto);next++;stage=0;targetDeadline=DateTime.MinValue;due=DateTime.UtcNow.AddMilliseconds(colorRuntime.Enabled&&colorCrushed?1100:40);
+                        before.Dispose();before=null;activeRemaining.Remove(sequence[next]);if(energyMode)foreach(string auto in energySteps[next].AutoRemoved)activeRemaining.Remove(auto);next++;StepsSinceFullCheck++;stage=0;effectSampleSaved=false;targetDeadline=DateTime.MinValue;settleDeadline=DateTime.MinValue;due=DateTime.UtcNow.AddMilliseconds(Ultra?0:colorRuntime.Enabled&&colorCrushed?1100:40);
                         if(stopRequested)throw new OperationCanceledException("已按 F9 停止；最后一次点击已确认");SaveStatus(folder,next,sequence.Length,tray,"running","");
                     }catch(Exception e){reason=e.Message;result=1;timer.Stop();overlay.Close();Application.ExitThread();}
                 };
                 SaveStatus(folder,next,sequence.Length,tray,"running","");timer.Start();Application.Run();
-                if(before!=null)before.Dispose();if(settledFrame!=null)settledFrame.Dispose();if(learningFrame!=null)learningFrame.Dispose();foreach(var im in learned.Values)im.Dispose();SaveStatus(folder,next,sequence.Length,tray,result==0?(next==sequence.Length?(rollingMode&&!boardCleared?"segment_finished":"sequence_finished"):"paused_at_limit"):"stopped",reason);Console.WriteLine(reason);return result;
+                if(before!=null)before.Dispose();if(fullFrame!=null)fullFrame.Dispose();if(settledFrame!=null)settledFrame.Dispose();if(learningFrame!=null)learningFrame.Dispose();foreach(var im in learned.Values)im.Dispose();SaveStatus(folder,next,sequence.Length,tray,result==0?(next==sequence.Length?(rollingMode&&!boardCleared?"segment_finished":"sequence_finished"):"paused_at_limit"):"stopped",reason);Console.WriteLine(reason);return result;
             }
         }catch(Exception e){Console.Error.WriteLine(e.Message);return 1;}
     }

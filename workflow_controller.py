@@ -81,7 +81,7 @@ class Controller:
         self.inspect_only=False
         self.wait_reason=None;self.wait_count=0;self.inspect_wait_key=None;self.inspect_wait_error=None
         self.state='connecting';self.message='正在连接抓取服务';self.started=time.monotonic()
-        self.settings={'performance':2,'seconds':60,'click_speed':1,'rolling':True}
+        self.settings={'performance':2,'seconds':60,'click_speed':1,'rolling':True,'verification_mode':'normal','full_check_interval':30}
         self.settings.update(read(ROOT/'output/app_preferences.json'))
         import static_plan
         self.scheduler_runtime={'version':static_plan.SCHEDULER_VERSION,'sources':static_plan.SCHEDULER_SOURCES}
@@ -114,6 +114,14 @@ class Controller:
     def command(self,action,settings=None):
         if action in ('start','retry','refresh'):self.prop_result=None
         if settings:self.settings.update(settings);self.save_settings()
+        if action=='start_prop':
+            if self.player or self.job:return
+            result=getattr(self,'prop_result',None)
+            if not result:raise ValueError('当前没有已验证的一次移出路线，请先求解')
+            self.auto=True;self.paused=False;self.stopping=False;self.blocked=''
+            self.submit('prepare',self.prepare_prop,result['solution_path']);return
+        if action=='confirm_move_out':
+            self.play_command('confirm_move_out');return
         if action=='settings':
             if self.search_folder and self.job_kind=='solve':atomic_json(self.search_folder/'search_control.json',{'action':'settings','performance':self.performance()})
             if self.player and self.player.poll() is None:self.play_command('speed',**self.timing())
@@ -163,8 +171,11 @@ class Controller:
 
     def timing(self):
         speed=max(0,min(2,int(self.settings['click_speed'])))
-        # Fastest still commits only after the tray count matches on two stable frames.
-        return {'mark_milliseconds':[650,300,60][speed],'verify_milliseconds':[1100,650,200][speed]}
+        mode=self.settings.get('verification_mode','normal')
+        if mode not in ('normal','ultra','safe_ultra'):mode='normal'
+        return {'mark_milliseconds':0 if mode!='normal' else [650,300,60][speed],
+                'verify_milliseconds':20 if mode!='normal' else [1100,650,200][speed],
+                'verification_mode':mode,'full_check_interval':max(1,min(1000,int(self.settings.get('full_check_interval',30))))}
 
     def play_command(self,action,**extras):
         if self.player and self.player.poll() is None:
@@ -319,10 +330,17 @@ class Controller:
         if self.stopping or self.paused or self.epoch!=epoch:raise ValueError('已暂停原版求解')
         bridge.current(self.mode,level,self.session)
         if answer.get('execution_kind')=='manual_move_out_v1':
-            return {'prop_route_ready':True,'solution_path':str(path),'message':f"一次移出路线已验证，共{answer['operation_count']}个操作；请查看操作表，执行功能待人工移出和坐标校准"}
+            return {'prop_route_ready':True,'solution_path':str(path),'message':f"一次移出路线已验证，共{answer['operation_count']}个操作；点击“执行到手动移出”，到点后只需手动使用一次道具"}
         if answer.get('execution_kind')=='rolling_segment_v1':
             return bridge.prepare_segment(context,folder,mp,data,level,self.mode,path)
         return bridge.prepare_continuation(context,folder,mp,data,level,self.mode,path)
+
+    def prepare_prop(self,source):
+        import prop_playback
+        folder,mp,data=bridge.current(self.mode,self.level,self.session)
+        context=self.last_result or bridge.inspect_board(folder,bridge.capture_snapshot(),self.count)
+        if context['level']!=self.level:raise ValueError('当前棋盘不是移出路线所属关卡')
+        return prop_playback.prepare(context,folder,mp,data,self.level,self.mode,Path(source))
 
     def collect_job(self):
         if not self.job or not self.job.done():return
@@ -403,6 +421,11 @@ class Controller:
                 self.stage('waiting_start','当前棋盘已识别；点击开始托管后求解并执行本关');return
             if result.get('fresh_attempt'):self.rotate_attempt(result)
             level=result['level'];self.level=level;self.last_result=result;self.last_board=str(OUT/'board.png')
+            if result.get('prop_execution'):
+                self.play_folder=self.folder/f'level_{level}_play'
+                if result.get('prop_finished'):
+                    self.finished.add(level);self.stage('finished','道具路线已全部核对完成');return
+                self.ready=result;self.stage('ready',result['message']);return
             from board_watch import BoardWatch
             self.board_watch=BoardWatch(result['image']) if result.get('image') else None
             self.next_board_watch=time.monotonic()+2
@@ -430,11 +453,12 @@ class Controller:
             # not become a plan for the old screen.
             self.next_inspect=0;self.stage('identifying','答案已验证，重新核对当前棋盘')
         elif kind in ('prepare','rolling','standard','original'):
+            if result.get('prop_execution'):self.prop_result=None
             self.ready=result;self.last_board=result['preview_path'];self.next_inspect=time.monotonic()+2
             self.stage('ready',result['message'])
 
     def start_player(self):
-        if getattr(self,'prop_result',None):raise ValueError('道具路线需要人工移出和坐标校准，不能交给普通点击器')
+        if getattr(self,'prop_result',None) and not (self.ready or {}).get('prop_execution'):raise ValueError('道具路线请从“执行到手动移出”入口启动')
         result=self.ready;path=Path(result['plan_path']);plan=read(path)
         if plan.get('allow_rolling'):
             answer=read(Path(plan['solution_path']))
@@ -445,8 +469,10 @@ class Controller:
         (self.play_folder/'control.json').unlink(missing_ok=True)
         if not plan.get('allow_rolling'):(self.play_folder/'playback_status.json').unlink(missing_ok=True)
         self.player_log=(self.play_folder/'player_process.log').open('a',encoding='utf-8')
-        self.player=subprocess.Popen([str(ROOT/'SolverPlayback.exe'),str(path)],cwd=ROOT,
+        command=[sys.executable,str(ROOT/'prop_playback.py'),str(path)] if result.get('prop_execution') else [str(ROOT/'SolverPlayback.exe'),str(path)]
+        self.player=subprocess.Popen(command,cwd=ROOT,
             stdout=self.player_log,stderr=self.player_log,creationflags=NO_WINDOW)
+        if result.get('prop_execution'):self.prop_result=None
         self.player_epoch=self.epoch;self.player_level=self.level
         message='开源原版：沿当前牌型路线执行，牌型改变后重算' if self.settings.get('solver_engine')=='upstream_normal_snapshot_v1' else '边算边玩：执行已核对的小段，红框标出下一步' if plan.get('allow_rolling') else '按已验证答案后台点击，红框标出下一步'
         self.ready=None;self.stage('playing',message)
@@ -459,8 +485,11 @@ class Controller:
             if state=='paused':self.stage('paused','托管已暂停；点击继续即可续接')
             elif state=='learning':self.stage('learning',status.get('message','正在学习新露出的牌型'))
             elif state=='waiting_target':self.stage('waiting_target',status.get('message','等待临时提示离开目标牌'))
+            elif state=='waiting_effect':self.stage('waiting_effect',status.get('message','等待游戏消除特效离开目标'))
+            elif state=='waiting_manual_move':self.stage('waiting_manual_move',status.get('message','请手动使用一次移出道具'))
             elif state=='waiting_alien':self.stage('verifying',status.get('message','等待飞碟消牌与棋盘稳定'))
-            elif state=='input_sent':self.stage('verifying','点击已发送，等待牌面与牌槽稳定')
+            elif state=='full_check':self.stage('verifying',status.get('message','正在自动核对全盘'))
+            elif state=='input_sent':self.stage('verifying','确认目标牌消失后立即继续' if status.get('verification_mode') in ('ultra','safe_ultra') else '点击已发送，等待牌面与牌槽稳定')
             else:self.stage('playing','开源原版：沿当前牌型路线执行' if self.settings.get('solver_engine')=='upstream_normal_snapshot_v1' else '边算边玩：执行当前小段' if read(self.play_folder/'plan.json').get('allow_rolling') else '按已验证答案后台点击，红框标出下一步')
             return
         code=self.player.returncode;pid=self.player.pid;self.player_log.close();self.player_log=None;self.player=None
@@ -479,9 +508,9 @@ class Controller:
             message=(status.get('message') if status.get('pid')==pid else '') or (lines[-1] if lines else '点击器异常退出')
             if self.auto and status.get('input_pending'):
                 self.ready=None;self.next_inspect=time.monotonic()+1
-                self.await_board('waiting_resume','地图和种子已就绪，正在复核刚才的点击是否生效');return
+                self.await_board('waiting_resume','游戏消除特效遮住了点击结果；关闭游戏内“消除效果”后自动复核，未确认步骤不会重放' if '游戏消除特效' in message else '地图和种子已就绪，正在复核刚才的点击是否生效');return
             if self.auto and not status.get('input_pending') and any(token in message for token in (
-                '实际牌槽','棋盘与坐标校准截图不一致','目标牌图案未通过核对','窗口位置或尺寸改变','窗口不存在或已最小化','后台截图')):
+                '实际牌槽','棋盘与坐标校准截图不一致','目标牌图案未通过核对','窗口位置或尺寸改变','窗口尺寸改变','窗口不存在或已最小化','后台截图','游戏消除特效')):
                 # Re-identify after a transient change, but the same step
                 # failing the same way again is not transient: stop and say so.
                 key=(self.player_level,status.get('next_step'),message.split(' score=')[0])
@@ -497,7 +526,7 @@ class Controller:
         search=read(self.search_folder/'search_status.json') if self.search_folder else {}
         playback=read(self.play_folder/'playback_status.json') if self.play_folder else {}
         if self.player:
-            image=self.play_folder/('next_click.png' if playback.get('state') in ('marking','learning') else 'last_verified.png')
+            image=self.play_folder/('effect_obscured.png' if playback.get('state')=='waiting_effect' else 'next_click.png' if playback.get('state') in ('marking','learning') else 'last_verified.png')
             if image.exists():self.last_board=str(image)
         display_message=self.message
         tail=search.get('tail_search',{})
@@ -513,7 +542,7 @@ class Controller:
             'map_count':self.count,'maps_received':capture.get('maps_received',0),'seed_received':capture.get('seed_received',False),
             'capture_phase':capture.get('phase'),'game_requests':capture.get('game_requests',0),
             'last_packet':capture.get('updated_at'),'search':search,'playback':playback,
-            'preview_path':self.last_board,'can_resume':bool(self.ready and self.ready.get('start_step')),
+            'preview_path':self.last_board,'can_resume':bool(self.ready and (self.ready.get('start_step') or self.ready.get('prop_execution'))),
             'ready':bool(self.ready),'blocked_reason':self.blocked,'busy':bool(self.job),
             'settings':self.settings,'finished_levels':sorted(self.finished),
             'controller_source_sha256':CONTROLLER_SOURCE_SHA256,'scheduler_runtime':getattr(self,'scheduler_runtime',{}),
@@ -588,7 +617,7 @@ class Controller:
         elif self.player or self.job:pass
         elif self.stopping:self.stage('stopped','托管已停止；点击开始可核对并续接')
         elif self.paused:self.stage('paused','托管已暂停；准备与答案已保留')
-        elif getattr(self,'prop_result',None):self.stage('prop_ready',self.prop_result['message'])
+        elif getattr(self,'prop_result',None) and not self.blocked:self.stage('prop_ready',self.prop_result['message'])
         elif self.waiting_new_game:self.stage('waiting_new_game',self.waiting_new_game+'；等待新局自动重新计算')
         elif self.blocked:
             search=read(self.search_folder/'search_status.json') if self.search_folder else {}
