@@ -15,12 +15,17 @@ import uuid
 
 import app_bridge as bridge
 from capture_service import alive
+from color_rules import initial_cards
 from solve_verified_map import atomic_json
 
 ROOT=Path(__file__).resolve().parent
 OUT=ROOT/'output/workflow'
 CAPTURE=ROOT/'output/auto_capture'
 NO_WINDOW=subprocess.CREATE_NO_WINDOW
+# Speed runs skip the complete solve. Ten seconds reach 180+ steps on the hardest maps,
+# so three cover the first 100; small opening levels still solve normally.
+PARTIAL_SEARCH_SECONDS=3
+PARTIAL_MIN_CARDS=60
 CONTROLLER_SOURCE_SHA256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
@@ -68,10 +73,12 @@ class Controller:
     def __init__(self):
         OUT.mkdir(parents=True,exist_ok=True);(OUT/'commands').mkdir(exist_ok=True)
         self.pool=ThreadPoolExecutor(max_workers=1)
+        self.prefetch_pool=ThreadPoolExecutor(max_workers=1);self.prefetch=None;self.prefetch_output=None;self.closing=False
         self.job=None;self.job_kind='';self.job_epoch=0;self.epoch=0;self.command_process=None
         self.auto=False;self.paused=False;self.stopping=False;self.owns_capture=False;self.quit=False
         self.session='';self.mode='daily';self.level=None;self.folder=None;self.count=0
         self.ready=None;self.player=None;self.player_log=None;self.play_folder=None
+        self.test_stop_remaining=0
         self.finished=set();self.blocked='';self.next_inspect=0;self.search_folder=None
         self.want_restore=False;self.player_epoch=0;self.player_level=None
         self.settle_attempted=False;self.settled=False
@@ -81,7 +88,7 @@ class Controller:
         self.inspect_only=False
         self.wait_reason=None;self.wait_count=0;self.inspect_wait_key=None;self.inspect_wait_error=None
         self.state='connecting';self.message='正在连接抓取服务';self.started=time.monotonic()
-        self.settings={'performance':2,'seconds':60,'click_speed':1,'rolling':True,'verification_mode':'normal','full_check_interval':30}
+        self.settings={'performance':2,'seconds':60,'click_speed':1,'rolling':True,'verification_mode':'normal','full_check_interval':30,'partial_steps':0}
         self.settings.update(read(ROOT/'output/app_preferences.json'))
         import static_plan
         self.scheduler_runtime={'version':static_plan.SCHEDULER_VERSION,'sources':static_plan.SCHEDULER_SOURCES}
@@ -112,6 +119,10 @@ class Controller:
         self.stage(state,message)
 
     def command(self,action,settings=None):
+        # An explicit test run preserves the last ten route steps for further
+        # experiments. This is session-only and never saved as a user preference.
+        if action=='start_test':self.test_stop_remaining=10;action='start'
+        elif action=='start':self.test_stop_remaining=0
         if action in ('start','retry','refresh'):self.prop_result=None
         if settings:self.settings.update(settings);self.save_settings()
         if action=='start_prop':
@@ -175,6 +186,13 @@ class Controller:
         if mode not in ('normal','ultra','safe_ultra'):mode='normal'
         return {'mark_milliseconds':0 if mode!='normal' else [650,300,60][speed],
                 'verify_milliseconds':20 if mode!='normal' else [1100,650,200][speed],
+                'full_speed':bool(self.settings.get('full_speed',False)) and mode!='normal',
+                # Fast-mode pacing. The client drops a few clicks soon after a
+                # triple clears; those are resent after retry_milliseconds.
+                # Both gaps are measured floors from complete real games; faster
+                # clicks caused lost triples at a full tray, which lose the game.
+                'retry_milliseconds':500,'clear_gap_milliseconds':150,'click_gap_milliseconds':135,
+                'burst_gap_milliseconds':35,'clear_hold_milliseconds':460,
                 'verification_mode':mode,'full_check_interval':max(1,min(1000,int(self.settings.get('full_check_interval',30))))}
 
     def play_command(self,action,**extras):
@@ -318,9 +336,66 @@ class Controller:
         from original_snapshot import plan_current
         return plan_current,folder/f'level_{level}_original'
 
+    def start_prefetch(self,level):
+        """Solve the next level while this one plays. Both maps arrive together,
+        and plan_current's verified cache hands the result to plan_original. It
+        starts only with the player, so the current board keeps every CPU until
+        it is executing; the actual screenshot still chooses what gets played."""
+        if self.settings.get('solver_engine')!='static_constraint_v1' or not self.folder or not isinstance(level,int):return
+        if self.settings.get('partial_steps'):return
+        following=level+1
+        if following>=self.count:return
+        if self.prefetch and not self.prefetch.done():return
+        mp=self.folder/f'map_{following}.json'
+        if not mp.is_file():return
+        data=read(mp)
+        if bridge.compatibility(data)!='standard':return
+        plan_current,output=self.fixed_planner(self.folder,following,data)
+        if output==self.prefetch_output or (output/'complete/solution.json').exists():return
+        # Half the cores: the game and the player share this machine while it runs.
+        epoch=self.epoch;seconds=min(300,max(30,float(self.settings['seconds'])));performance='eco' if self.performance()=='eco' else 'fast'
+        self.prefetch_output=output
+        self.prefetch=self.prefetch_pool.submit(plan_current,mp,[],output,seconds=seconds,
+            cancel=lambda:self.closing or self.stopping or self.paused or self.epoch!=epoch,performance=performance)
+
+    def join_prefetch(self,output,cancel):
+        # One planner owns an output folder at a time. A failed prefetch is not
+        # an error: the normal plan below searches again from its saved hints.
+        job=self.prefetch
+        if not job or output!=self.prefetch_output:return
+        while not job.done():
+            if cancel():raise ValueError('已暂停原版求解')
+            time.sleep(.05)
+
+    def plan_partial(self,context,folder,mp,data,output,epoch):
+        """Speed run: a few seconds of search, then only the first steps are played."""
+        import speed_test
+        from static_accelerator import prepare as search
+        level=context['level'];cancel=lambda:self.stopping or self.paused or self.epoch!=epoch
+        workers={'eco':1,'fast':max(1,(os.cpu_count() or 1)//2)}.get(self.performance(),os.cpu_count() or 1)
+        search(mp,data,[],output/'accelerator',PARTIAL_SEARCH_SECONDS,workers,cancel,lambda **kw:None)
+        if cancel():raise ValueError('已暂停原版求解')
+        bridge.current(self.mode,level,self.session)
+        _,_,path,segment=speed_test.build_segment(folder,level,int(self.settings['partial_steps']))
+        result=bridge.prepare(folder,mp,data,level,self.mode,context.get('calibration'),Path(context['image']),solution_path=path)
+        plan=read(Path(result['plan_path']));plan['partial_run']=True;atomic_json(Path(result['plan_path']),plan)
+        for name in ('actions.jsonl','input_recovery.jsonl'):(Path(result['plan_path']).parent/name).unlink(missing_ok=True)
+        result['message']=f"不求完整解，直接执行前 {len(segment['sequence'])} 步"
+        return result
+
+    def partial_report(self):
+        import speed_test
+        actions=speed_test.lines(self.play_folder/'actions.jsonl')
+        report=speed_test.summarize(actions,speed_test.lines(self.play_folder/'input_recovery.jsonl'))
+        atomic_json(self.play_folder/'speed_test.json',report)
+        return f"{report['steps']} 步用时 {report['seconds']} 秒，换算整局约 {report['whole_game_seconds']} 秒；这局不能继续，请重开"
+
     def plan_original(self,context):
         level=context['level'];folder,mp,data=bridge.current(self.mode,level,self.session);epoch=self.epoch
         plan_current,output=self.fixed_planner(folder,level,data)
+        if self.settings.get('partial_steps') and not context.get('resume') and bridge.compatibility(data)=='standard' and len(initial_cards(data)[0])>PARTIAL_MIN_CARDS:
+            return self.plan_partial(context,folder,mp,data,output,epoch)
+        self.join_prefetch(output,lambda:self.stopping or self.paused or self.epoch!=epoch)
         prefix=[]
         if context.get('resume'):
             previous=read(Path(context['plan']['solution_path']));prefix=previous['sequence'][:context['start_step']]
@@ -355,7 +430,12 @@ class Controller:
                 if kind=='inspect':
                     self.last_result=None;self.board_watch=None;self.level=None
                     self.search_folder=None;self.play_folder=None
-                self.ready=None;self.await_board(e.state,message);return
+                self.ready=None;self.await_board(e.state,message)
+                # These answers do not change by waiting: the board has left the
+                # route. Say so, but keep inspecting so a restart resumes by itself.
+                if e.state=='waiting_resume' and self.wait_count>=3 and any(text in message for text in ('预期牌槽结果','牌面变化证据','牌槽预测不一致','连点组与棋盘对不上')):
+                    self.stage('waiting_resume','这局已偏离路线，无法续接；请在游戏里重新开始本局，重开后自动继续')
+                return
             if kind=='transport':
                 self.transport_error=message;self.transport_next=time.monotonic()+15
                 self.stage('waiting_capture','抓取连接尚未恢复，正在自动重试；'+message);return
@@ -460,9 +540,12 @@ class Controller:
     def start_player(self):
         if getattr(self,'prop_result',None) and not (self.ready or {}).get('prop_execution'):raise ValueError('道具路线请从“执行到手动移出”入口启动')
         result=self.ready;path=Path(result['plan_path']);plan=read(path)
+        if self.test_stop_remaining and self.level==self.count-1 and (result.get('prop_execution') or plan.get('allow_rolling')):
+            self.auto=False;self.paused=True
+            self.stage('paused','测试暂停仅适用于普通完整路线，已保留当前棋盘');return
         if plan.get('allow_rolling'):
             answer=read(Path(plan['solution_path']))
-            if 'tray_capacity' not in answer and answer.get('planning_engine') not in ('upstream_normal_snapshot_v1','energy_static_v1'):
+            if not plan.get('partial_run') and 'tray_capacity' not in answer and answer.get('planning_engine') not in ('upstream_normal_snapshot_v1','energy_static_v1'):
                 self.ready=None;self.next_inspect=0;self.stage('identifying','旧短段已保留，按动态容量重新规划');return
         plan.update(self.timing());plan.update(dynamic_anchors=True,adaptive_verify=True)
         atomic_json(path,plan);self.play_folder=path.parent
@@ -470,10 +553,16 @@ class Controller:
         if not plan.get('allow_rolling'):(self.play_folder/'playback_status.json').unlink(missing_ok=True)
         self.player_log=(self.play_folder/'player_process.log').open('a',encoding='utf-8')
         command=[sys.executable,str(ROOT/'prop_playback.py'),str(path)] if result.get('prop_execution') else [str(ROOT/'SolverPlayback.exe'),str(path)]
+        if self.test_stop_remaining and self.level==self.count-1:
+            answer=read(Path(plan['solution_path']))
+            command.append(str(max(0,len(answer['sequence'])-self.test_stop_remaining)))
         self.player=subprocess.Popen(command,cwd=ROOT,
             stdout=self.player_log,stderr=self.player_log,creationflags=NO_WINDOW)
         if result.get('prop_execution'):self.prop_result=None
         self.player_epoch=self.epoch;self.player_level=self.level
+        # An optional head start must never stand between a ready board and play.
+        try:self.start_prefetch(self.level)
+        except (OSError,ValueError,KeyError,TypeError):pass
         message='开源原版：沿当前牌型路线执行，牌型改变后重算' if self.settings.get('solver_engine')=='upstream_normal_snapshot_v1' else '边算边玩：执行已核对的小段，红框标出下一步' if plan.get('allow_rolling') else '按已验证答案后台点击，红框标出下一步'
         self.ready=None;self.stage('playing',message)
 
@@ -494,7 +583,13 @@ class Controller:
             return
         code=self.player.returncode;pid=self.player.pid;self.player_log.close();self.player_log=None;self.player=None
         if self.player_epoch!=self.epoch:self.play_folder=None;self.next_inspect=0;return
-        if code==0 and status.get('state')=='segment_finished':
+        if code==0 and status.get('state')=='paused_at_limit':
+            self.auto=False;self.paused=True;self.ready=None
+            self.stage('paused','测试已提前暂停，保留最后 10 步和已确认断点，可继续用于测试')
+        elif code==0 and status.get('state')=='segment_finished' and read(self.play_folder/'plan.json').get('partial_run'):
+            self.blocked=self.partial_report();self.auto=False;self.ready=None
+            self.stage('search_limited',self.blocked)
+        elif code==0 and status.get('state')=='segment_finished':
             self.next_inspect=0;self.stage('identifying','更新当前牌型；未改变则沿用原版路线，改变则重新求解' if self.settings.get('solver_engine')=='upstream_normal_snapshot_v1' else '本段已确认，重新核对棋盘并计算下一段')
         elif code==0 and status.get('state')=='sequence_finished':
             self.finished.add(self.player_level);self.next_inspect=time.monotonic()+1.2
@@ -650,6 +745,7 @@ class Controller:
         self.snapshot(capture,service)
 
     def close(self):
+        self.closing=True
         self.play_command('stop')
         if self.player:
             try:self.player.wait(timeout=6)
@@ -667,6 +763,7 @@ class Controller:
                     process=self.command_process
                     if process and process.poll() is None:subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True,creationflags=NO_WINDOW,timeout=10)
         self.pool.shutdown(wait=True,cancel_futures=True)
+        self.prefetch_pool.shutdown(wait=True,cancel_futures=True)
         try:
             if self.owns_capture:
                 from capture_service import preserve_upgrade,process_ancestors

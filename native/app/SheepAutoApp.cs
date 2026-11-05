@@ -193,7 +193,7 @@ sealed class AutoSheepForm : Form {
         searchText.Dock=DockStyle.Fill;searchText.ForeColor=muted;searchText.BackColor=Ui.Soft;searchText.Font=Ui.F(8.75f);searchText.TextAlign=ContentAlignment.TopLeft;searchText.Text="";detailBox.Controls.Add(searchText,0,0);right.Controls.Add(detailBox,0,10);
 
         speed.DropDownStyle=ComboBoxStyle.DropDownList;speed.Items.AddRange(new object[]{"稳妥 · 2 秒/步","快速 · 1.2 秒/步","极速 · 动态核对"});speed.SelectedIndex=1;speed.SelectedIndexChanged+=delegate{if(!suppress)Send("settings");};
-        verification.DropDownStyle=ComboBoxStyle.DropDownList;verification.Items.AddRange(new object[]{"逐步核对（默认）","超高速 · 只确认目标牌消失","安全超高速 · 定期全盘核对"});verification.SelectedIndex=0;verification.SelectedIndexChanged+=delegate{if(!suppress)Send("settings");};
+        verification.DropDownStyle=ComboBoxStyle.DropDownList;verification.Items.AddRange(new object[]{"逐步核对（默认）","超高速 · 只确认目标牌消失","安全超高速 · 定期全盘核对","全速 · 沿已验证路线执行"});verification.SelectedIndex=0;verification.SelectedIndexChanged+=delegate{if(!suppress)Send("settings");};
         checkInterval.Minimum=1;checkInterval.Maximum=1000;checkInterval.Value=30;checkInterval.ValueChanged+=delegate{if(!suppress)Send("settings");};
         performance.DropDownStyle=ComboBoxStyle.DropDownList;performance.Items.AddRange(new object[]{"省资源 · 单路","快速 · 自动并行","全速 · 空闲资源"});performance.SelectedIndex=2;performance.SelectedIndexChanged+=delegate{if(!suppress)Send("settings");};
         seconds.Minimum=30;seconds.Maximum=300;seconds.Increment=30;seconds.Value=180;seconds.ValueChanged+=delegate{if(!suppress)Send("settings");};
@@ -206,7 +206,7 @@ sealed class AutoSheepForm : Form {
     static string Range(Dictionary<string,object> d,string min,string max){return V(d,min)==V(d,max)?V(d,min):V(d,min)+"～"+V(d,max);}
     static bool B(Dictionary<string,object> d,string key){return d!=null&&d.ContainsKey(key)&&d[key]!=null&&Convert.ToBoolean(d[key]);}
     static Dictionary<string,object> D(Dictionary<string,object> d,string key){return d!=null&&d.ContainsKey(key)&&d[key] is Dictionary<string,object>?(Dictionary<string,object>)d[key]:new Dictionary<string,object>();}
-    Dictionary<string,object> Settings(){return new Dictionary<string,object>{{"performance",performance.SelectedIndex},{"click_speed",speed.SelectedIndex},{"seconds",(int)seconds.Value},{"verification_mode",new[]{"normal","ultra","safe_ultra"}[Math.Max(0,verification.SelectedIndex)]},{"full_check_interval",(int)checkInterval.Value}};}
+    Dictionary<string,object> Settings(){return new Dictionary<string,object>{{"performance",performance.SelectedIndex},{"click_speed",speed.SelectedIndex},{"seconds",(int)seconds.Value},{"verification_mode",new[]{"normal","ultra","safe_ultra","ultra"}[Math.Max(0,verification.SelectedIndex)]},{"full_speed",verification.SelectedIndex==3},{"full_check_interval",(int)checkInterval.Value}};}
     void Send(string action){if(preview||closing)return;try{string directory=Path.Combine(root,"output","workflow","commands");Directory.CreateDirectory(directory);string id=DateTime.UtcNow.Ticks+"_"+Guid.NewGuid().ToString("N");string path=Path.Combine(directory,id+".json"),temp=path+".tmp";File.WriteAllText(temp,json.Serialize(new Dictionary<string,object>{{"action",action},{"settings",Settings()}}),new UTF8Encoding(false));File.Move(temp,path);if(action=="start"){primary.Text="正在接续…";primary.Enabled=false;}Event("操作："+(action=="start"?"开始或继续托管":action=="pause"?"暂停托管":action=="stop"?"停止托管":action=="settings"?"更新速度与性能":action));}catch(Exception e){message.Text=e.Message;}}
     async Task Connect(){if(connecting||DateTime.UtcNow-lastConnect<TimeSpan.FromSeconds(3))return;connecting=true;lastConnect=DateTime.UtcNow;try{await Task.Run(()=>{using(var p=Process.Start(new ProcessStartInfo{FileName=Path.Combine(root,"venv","Scripts","python.exe"),Arguments="\""+Path.Combine(root,"workflow_controller.py")+"\" start",WorkingDirectory=root,UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true})){string error=p.StandardError.ReadToEnd();p.StandardOutput.ReadToEnd();if(!p.WaitForExit(10000)||p.ExitCode!=0)throw new Exception(error);}});}catch(Exception e){message.Text="后台连接失败："+e.Message;}finally{connecting=false;}}
     async Task Poll(){if(closing||preview)return;try{string path=Path.Combine(root,"output","workflow","status.json");bool alive=false;
@@ -287,7 +287,7 @@ sealed class AutoSheepForm : Form {
         SetText(title,text);SetText(message,mainMessage);
         var chipList=new List<string>{game};if(level>0)chipList.Add("第 "+level+" / "+V(d,"map_count")+" 关");
         string verifyMode=V(ps,"verification_mode",V(settings,"verification_mode","normal"));
-        if(verifyMode=="ultra")chipList.Add("超高速");else if(verifyMode=="safe_ultra")chipList.Add("安全超高速 · "+V(ps,"steps_since_full_check","0")+" / "+V(ps,"full_check_interval",V(settings,"full_check_interval","30")));
+        if(verifyMode=="ultra")chipList.Add(B(ps,"full_speed")||B(settings,"full_speed")?"全速":"超高速");else if(verifyMode=="safe_ultra")chipList.Add("安全超高速 · "+V(ps,"steps_since_full_check","0")+" / "+V(ps,"full_check_interval",V(settings,"full_check_interval","30")));
         if(V(d,"rules")=="color_shuffle")chipList.Add("消除后变色");else if(V(d,"rules")=="energy_alien")chipList.Add("电量与飞碟");
         chipList.Add(constraint||V(search,"engine")=="static_constraint_v1"?"整局约束求解":original?"原版回溯":rolling?"边算边玩":"完整路线");
         if(V(ps,"rules")=="energy_alien_v1")chipList.Add(B(ps,"alien_pending")?"等待飞碟":Convert.ToInt32(V(ps,"alien_activations","0"))>0?"飞碟已召唤":"电量 "+V(ps,"energy_count")+" / "+V(ps,"collect_count"));
@@ -329,7 +329,7 @@ sealed class AutoSheepForm : Form {
         suppress=true;try{if(settings.Count>0){
             int p=Math.Max(0,Math.Min(2,Convert.ToInt32(V(settings,"performance","2")))),s=Math.Max(0,Math.Min(2,Convert.ToInt32(V(settings,"click_speed","1"))));decimal sec=Math.Max(30,Math.Min(300,Convert.ToDecimal(V(settings,"seconds","180"))));
             if(performance.SelectedIndex!=p)performance.SelectedIndex=p;if(speed.SelectedIndex!=s)speed.SelectedIndex=s;if(seconds.Value!=sec)seconds.Value=sec;
-            string mode=V(settings,"verification_mode","normal");int v=mode=="safe_ultra"?2:mode=="ultra"?1:0;if(verification.SelectedIndex!=v)verification.SelectedIndex=v;
+            string mode=V(settings,"verification_mode","normal");int v=mode=="ultra"&&B(settings,"full_speed")?3:mode=="safe_ultra"?2:mode=="ultra"?1:0;if(verification.SelectedIndex!=v)verification.SelectedIndex=v;
             decimal interval=Math.Max(1,Math.Min(1000,Convert.ToDecimal(V(settings,"full_check_interval","30"))));if(checkInterval.Value!=interval)checkInterval.Value=interval;
         }}finally{suppress=false;}
         suppress=true;try{

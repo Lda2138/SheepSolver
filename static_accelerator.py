@@ -61,6 +61,11 @@ def boundary_cut(data,prefix,route,seconds=1,backtrack=True):
     return facts,audit
 
 
+def native_worker_count(workers,memory_budget,cpus=None):
+    """Use the requested CPUs when RAM can fund each independent search."""
+    return max(1,min(workers,cpus or os.cpu_count() or 1,int(memory_budget//(768*1024**2))))
+
+
 def prepare(map_path,data,prefix,folder,seconds,workers,cancel,notify):
     folder.mkdir(parents=True,exist_ok=True);start=time.monotonic()
     digest=hashlib.sha256(map_path.read_bytes()).hexdigest()
@@ -94,7 +99,8 @@ def prepare(map_path,data,prefix,folder,seconds,workers,cancel,notify):
             from search_resources import available_memory,state_cap
             attempt=int(cache.get('native_attempt',0))+1 if cache.get('scope')==scope else 1
             memory_budget=max(128*1024**2,available_memory()-2*1024**3)
-            count=max(1,min(8,workers,int(memory_budget//(768*1024**2))))
+            count=native_worker_count(workers,memory_budget)
+            memory_limits={}
             initial=((1997,.8),(7,0),(1,.8),(5,0),(6,.8),(8,0),(3,.8),(4,0))
             deadline=start+seconds
             def launch():
@@ -114,6 +120,9 @@ def prepare(map_path,data,prefix,folder,seconds,workers,cancel,notify):
                 process=subprocess.Popen([str(exe),str(map_path),str(out),'tight-top',str(first),str(budget),
                     str(seed),str(cap),str(progress),str(pp),'512'],cwd=ROOT,stdout=log,stderr=log,
                     creationflags=subprocess.CREATE_NO_WINDOW|subprocess.BELOW_NORMAL_PRIORITY_CLASS)
+                # Keep the primary search's larger state budget available;
+                # a flat per-process cap would kill it before that budget.
+                memory_limits[id(process)]=memory_budget*.9*(2 if index%count==0 else 1)/(count+1)
                 item=(process,out,progress);owned.append(item);active.append(item)
                 event={'index':index,'pid':getattr(process,'pid',None),'seed':seed,'solve_first':first,
                     'state_limit':cap,'slice_seconds':budget,'elapsed_seconds':time.monotonic()-start}
@@ -144,7 +153,7 @@ def prepare(map_path,data,prefix,folder,seconds,workers,cancel,notify):
                 # State estimates do not capture every CLR allocation peak.
                 # Memory-stopped workers remain UNKNOWN, never proof sources.
                 for p,out,progress in active:
-                    if p.poll() is None and sampler.process_memory(p)[1]>memory_budget/max(1,count):
+                    if p.poll() is None and sampler.process_memory(p)[1]>memory_limits[id(p)]:
                         p.terminate()
                         atomic_json(Path(str(out)+'.external_stop.json'),{'reason':'memory_limit','state':'unknown'})
                 time.sleep(.1)

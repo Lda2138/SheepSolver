@@ -72,6 +72,13 @@ def tray_count(image):
 def pattern_score(image,point,templates):
     import numpy as np
     x,y=point;best=1000.0
+    if not len(templates):return best
+    samples=[template[7:30:2,6:29:2] for template in templates]
+    # Every offset in one array operation; the loop below handles image edges.
+    if y>=15 and x>=14 and y+16<=image.shape[0] and x+15<=image.shape[1] and all(s.shape==(12,12,3) for s in samples):
+        windows=np.lib.stride_tricks.sliding_window_view(image[y-15:y+16,x-14:x+15],(23,23),axis=(0,1))[...,::2,::2]
+        stack=np.stack(samples).transpose(0,3,1,2)[:,None,None]
+        return min(best,float(np.abs(windows[None]-stack).sum(axis=(3,4,5),dtype=np.int64).min())/144)
     for template in templates:
         sample=template[7:30:2,6:29:2]
         for dy in range(-4,5):
@@ -177,7 +184,9 @@ def verify_tray_image(now,expected,templates):
     for k,t in enumerate(expected):
         point=(43+42*k,511);score=pattern_score(image,point,scaled.get(t,[]))
         other=min((pattern_score(image,point,values) for typ,values in scaled.items() if typ!=t),default=1000)
-        if score>75 or other<score+15:raise ValueError(f'第 {k+1} 格牌型尚未匹配')
+        # Slot art varies with scale, so a score just past 75 is still certain when
+        # no other type comes close; a nearby rival always rejects.
+        if other<score+15 or score>110 or score>75 and other<score+60:raise ValueError(f'第 {k+1} 格牌型尚未匹配')
 
 
 def verify_full_board(play,image_path,n,tray_only=False):
@@ -223,8 +232,28 @@ def reconcile_pending(folder,level,image_path):
     plan=read(play/'plan.json');solution=read(Path(plan['solution_path']));validate_execution(solution)
     if plan['session']!=folder.name or plan['map_sha256']!=hashlib.sha256((folder/f'map_{level}.json').read_bytes()).hexdigest():raise ValueError('未确认点击与当前局地图不一致')
     n=status['next_step'];sequence=solution['sequence'];cards={c['id']:c for c in solution['cards']}
-    actions=[json.loads(line) for line in (play/'actions.jsonl').read_text(encoding='utf-8-sig').splitlines() if line.strip()]
-    if not 0<n<len(sequence) or len(actions)!=n or any(a['step']!=i+1 or a['card_id']!=sequence[i] for i,a in enumerate(actions)):raise ValueError('未确认点击的前缀记录不完整')
+    action_path=play/'actions.jsonl'
+    actions=[json.loads(line) for line in action_path.read_text(encoding='utf-8-sig').splitlines() if line.strip()] if action_path.exists() else []
+    if not 0<=n<len(sequence) or len(actions)!=n or any(a['step']!=i+1 or a['card_id']!=sequence[i] for i,a in enumerate(actions)):raise ValueError('未确认点击的前缀记录不完整')
+    group=status.get('pending_group')
+    if group:
+        # A stopped full-speed group left several clicks unconfirmed. The board
+        # itself shows how far it got: the furthest step whose whole board and
+        # tray match. Nothing is resent here; play resumes from that step.
+        for k in range(min(n+int(group['count']),len(sequence)),n-1,-1):
+            try:verify_full_board(play,image_path,k)
+            except ValueError:continue
+            from PIL import Image
+            with action_path.open('a',encoding='utf-8') as out:
+                for i in range(n,k):
+                    out.write(json.dumps({'step':i+1,'card_id':sequence[i],'tray_count':len(solution_state(solution,i+1)[1]),
+                        'time':datetime.now(timezone.utc).isoformat(),'mode':'background','verification':'reconciled_group_full_board'},ensure_ascii=False)+'\n')
+            Image.open(image_path).convert('RGB').save(play/'last_verified.png')
+            status.pop('pending_group')
+            status.update(next_step=k,input_pending=False,expected_tray=solution_state(solution,k)[1],state='paused_at_verified',
+                message=f'连点组已按棋盘核对到第 {k} 步，从这里继续')
+            atomic_json(play/'playback_status.json',status);return True
+        raise ValueError('连点组与棋盘对不上')
     before=solution_state(solution,n)[1]
     t=solution.get('sequence_types',[cards[v]['type'] for v in sequence])[n]
     alien=bool(solution.get('energy_events') and solution['energy_events'][n]['alien'])
@@ -238,7 +267,10 @@ def reconcile_pending(folder,level,image_path):
     else:
         same=[k for k,v in enumerate(shown) if v==t];j=same[-1]+1 if same else len(shown)
         indices=[None if k==j else k if k<j else k-1 for k in range(len(shown_after))]
-    now=Image.open(image_path).convert('RGB');last=Image.open(play/'last_verified.png').convert('RGB')
+    # At step zero no confirmed-frame file exists yet. Use the exact frame
+    # calibrated for this start, never a reference from an earlier attempt.
+    last_path=play/'last_verified.png' if n else Path(plan.get('initial_reference_path',plan['reference_path']))
+    now=Image.open(image_path).convert('RGB');last=Image.open(last_path).convert('RGB')
     x,y=plan['positions'][sequence[n]]
     old_array=np.asarray(last,dtype=np.int16);now_array=np.asarray(now,dtype=np.int16)
     board_delta=float(np.abs(now_array[118:466,20:316]-old_array[118:466,20:316]).sum(axis=2).mean())
@@ -272,6 +304,9 @@ def reconcile_pending(folder,level,image_path):
                 'tray_delta':tray_delta,'target_delta':target_delta},ensure_ascii=False)+'\n')
         status.update(input_pending=False,expected_tray=before,state='paused_at_verified',
             message='上次点击未生效，已按未变化的棋盘和牌槽恢复，继续时重试该步')
+        if n==0:
+            now.save(play/'last_verified.png')
+            if not action_path.exists():action_path.write_text('',encoding='utf-8')
         atomic_json(play/'playback_status.json',status);return True
     # Evidence for any click: the tray holds exactly the predicted count, the
     # target changed, every surviving slot and exposed tile matches.
@@ -305,7 +340,7 @@ def checked_resume(folder,level,image_path):
     plan=recalibrate(play,plan,solution)
     n=status['next_step']
     rolling=solution.get('execution_kind')=='rolling_segment_v1'
-    if not 0<n<=len(solution['sequence']) or n==len(solution['sequence']) and not rolling:raise ValueError('当前没有可续接的断点')
+    if not 0<=n<=len(solution['sequence']) or n==len(solution['sequence']) and not rolling:raise ValueError('当前没有可续接的断点')
     if status.get('input_pending'):raise ValueError('上一次点击尚未确认，不能自动重放；请重新开局')
     actions=[json.loads(line) for line in (play/'actions.jsonl').read_text(encoding='utf-8-sig').splitlines() if line.strip()]
     if len(actions)!=n or any(action['step']!=i+1 or action['card_id']!=solution['sequence'][i] for i,action in enumerate(actions)):
@@ -316,7 +351,7 @@ def checked_resume(folder,level,image_path):
     if now.size!=(336,622) or last.size!=now.size:raise ValueError('棋盘截图尺寸不一致')
     difference=np.abs(np.asarray(now,dtype=np.int16)[118:466:2,25:311:2]-np.asarray(last,dtype=np.int16)[118:466:2,25:311:2]).sum(axis=2).mean()
     if tray_count(now)!=len(expected):raise ValueError('当前牌槽数量与确认记录不一致，无法自动续接')
-    if status.get('verification_mode') in ('ultra','safe_ultra'):
+    if n==0 or status.get('verification_mode') in ('ultra','safe_ultra'):
         verify_full_board(play,image_path,n)
     elif difference>5:
         check_path=play/'resume_check.png';now.save(check_path)

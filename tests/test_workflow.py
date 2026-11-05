@@ -203,6 +203,54 @@ class WorkflowTests(unittest.TestCase):
                 controller.command('start');self.assertIsNone(controller.player_retry_key)
             finally:controller.pool.shutdown(wait=True)
 
+    def test_speed_run_stops_after_its_steps_and_reports_time(self):
+        with tempfile.TemporaryDirectory() as directory,patch.object(workflow,'OUT',Path(directory)):
+            folder=Path(directory);controller=workflow.Controller();controller.auto=True
+            (folder/'playback_status.json').write_text(json.dumps({'pid':5,'next_step':2,'state':'segment_finished'}),encoding='utf-8')
+            (folder/'plan.json').write_text(json.dumps({'partial_run':True}),encoding='utf-8')
+            rows=[{'time':f'2026-11-05T10:00:0{n}.0000000+09:00','confirmation_ms':500.0} for n in (0,1)]
+            (folder/'actions.jsonl').write_text('\n'.join(json.dumps(row) for row in rows),encoding='utf-8')
+            class Done:
+                returncode=0;pid=5
+                def poll(self):return 0
+            try:
+                controller.play_folder=folder;controller.player=Done();controller.player_log=open(folder/'log.txt','a')
+                controller.player_epoch=controller.epoch;controller.player_level=1;controller.collect_player()
+                self.assertEqual(controller.state,'search_limited');self.assertFalse(controller.auto)
+                self.assertIn('2 步用时 1.5 秒',controller.blocked);self.assertTrue((folder/'speed_test.json').exists())
+            finally:controller.pool.shutdown(wait=True)
+
+    def test_speed_run_plan_starts_the_player_instead_of_replanning(self):
+        with tempfile.TemporaryDirectory() as directory,patch.object(workflow,'OUT',Path(directory)):
+            folder=Path(directory);controller=workflow.Controller();controller.auto=True
+            (folder/'solution.json').write_text(json.dumps({'sequence':['a']}),encoding='utf-8')
+            (folder/'plan.json').write_text(json.dumps({'allow_rolling':True,'partial_run':True,'solution_path':str(folder/'solution.json')}),encoding='utf-8')
+            controller.ready={'plan_path':str(folder/'plan.json')};controller.level=1
+            try:
+                with patch.object(workflow.subprocess,'Popen') as popen:
+                    controller.start_player()
+                    self.assertTrue(popen.called);self.assertEqual(controller.state,'playing')
+                controller.player=None;controller.player_log.close();controller.player_log=None
+            finally:controller.pool.shutdown(wait=True)
+
+    def test_speed_run_skips_the_complete_solve_on_large_boards_only(self):
+        with tempfile.TemporaryDirectory() as directory,patch.object(workflow,'OUT',Path(directory)):
+            controller=workflow.Controller();folder=Path(directory);full=lambda *args,**kw:(folder/'s.json',{})
+            self.assertEqual(controller.settings['partial_steps'],0)
+            controller.settings['partial_steps']=100
+            try:
+                with patch.object(bridge,'current',return_value=(folder,folder/'m.json',{})),patch.object(bridge,'compatibility',return_value='standard'),\
+                     patch.object(bridge,'prepare_continuation',return_value='complete'),patch.object(controller,'fixed_planner',return_value=(full,folder)),\
+                     patch.object(controller,'plan_partial',return_value='partial'):
+                    with patch.object(workflow,'initial_cards',return_value=([{}]*249,None)):
+                        self.assertEqual(controller.plan_original({'level':1}),'partial')
+                        controller.settings['partial_steps']=0
+                        self.assertEqual(controller.plan_original({'level':1}),'complete')
+                        controller.settings['partial_steps']=100
+                    with patch.object(workflow,'initial_cards',return_value=([{}]*18,None)):
+                        self.assertEqual(controller.plan_original({'level':0}),'complete')
+            finally:controller.pool.shutdown(wait=True)
+
     def test_player_failing_before_its_first_status_reports_its_own_error(self):
         with tempfile.TemporaryDirectory() as directory,patch.object(workflow,'OUT',Path(directory)):
             folder=Path(directory);controller=workflow.Controller();controller.auto=True

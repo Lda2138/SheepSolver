@@ -68,6 +68,14 @@ class FastSettingsTests(unittest.TestCase):
             self.assertEqual(controller.timing()['full_check_interval'],1)
             controller.settings['full_check_interval']=99999
             self.assertEqual(controller.timing()['full_check_interval'],1000)
+            controller.settings.update(verification_mode='ultra',full_speed=True)
+            self.assertTrue(controller.timing()['full_speed'])
+            # Measured safe floor: real clears from a full tray ran at 140 ms or more.
+            self.assertGreaterEqual(controller.timing()['clear_gap_milliseconds'],140)
+            self.assertGreaterEqual(controller.timing()['click_gap_milliseconds'],130)
+            self.assertGreaterEqual(controller.timing()['retry_milliseconds'],150)
+            controller.settings['verification_mode']='normal'
+            self.assertFalse(controller.timing()['full_speed'])
             from unittest.mock import Mock
             controller.player=Mock();controller.player.poll.return_value=None
             with patch.object(controller,'save_settings'),patch.object(controller,'play_command') as send:

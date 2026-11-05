@@ -46,13 +46,20 @@ static class Native
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowLong(IntPtr hwnd, int index);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int SetWindowLong(IntPtr hwnd, int index, int value);
+    [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint milliseconds);
 
+    // Test builds can only ever find the fake window, never the real game.
+#if PLAYBACK_TEST
+    const string GameTitle="羊了个羊：测试窗口";
+#else
+    const string GameTitle="羊了个羊：星球";
+#endif
     public static List<IntPtr> FindGame()
     {
         var result=new List<IntPtr>();
         EnumWindows(delegate(IntPtr h, IntPtr p) {
             var name=new StringBuilder(512); GetWindowText(h,name,name.Capacity);
-            if(IsWindowVisible(h) && name.ToString()=="羊了个羊：星球") result.Add(h);
+            if(IsWindowVisible(h) && name.ToString()==GameTitle) result.Add(h);
             return true;
         },IntPtr.Zero);
         return result;
@@ -82,6 +89,7 @@ static class Native
         if(!ok||!Vision.ValidCapture(image)) {
             if(GetForegroundWindow()!=hwnd) { image.Dispose(); throw new InvalidOperationException("微信未提供后台截图。请手动把游戏置于前台再刷新，程序不会自动抢焦点。"); }
             using(var g=Graphics.FromImage(image)) g.CopyFromScreen(visible.Location,Point.Empty,visible.Size);
+            Vision.ForgetPixels(image);
             if(!Vision.ValidCapture(image)) {image.Dispose();throw new InvalidOperationException("截图不可用；已停止，不发送点击。");}
         }
         return image;
@@ -107,6 +115,14 @@ static class Native
             var up=new INPUT();up.type=0;up.data.mouse.flags=0x0004;
             if(SendInput(2,new INPUT[]{down,up},Marshal.SizeOf(typeof(INPUT)))!=2) throw new InvalidOperationException("系统没有接受鼠标输入。");
         }
+    }
+    // Capture for the per-step playback loop: a window already at the standard
+    // size is returned directly, skipping a clone and a second pixel copy.
+    public static Bitmap CaptureNormalized(IntPtr hwnd)
+    {
+        Bitmap raw=Capture(hwnd);
+        if(raw.Width==336&&raw.Height==622)return raw;
+        try{return Vision.Normalize(raw);}finally{raw.Dispose();}
     }
     public static bool ClickNormalized(IntPtr hwnd, Point normalized, Size expectedSize)
     {
@@ -192,8 +208,10 @@ static class Vision
             try{Stride=data.Stride;Data=new byte[Stride*Height];Marshal.Copy(data.Scan0,Data,0,Data.Length);}finally{image.UnlockBits(data);}}
     }
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Bitmap,Pixels> pixelCache=new System.Runtime.CompilerServices.ConditionalWeakTable<Bitmap,Pixels>();
+    public static Pixels GetPixels(Bitmap image){return pixelCache.GetValue(image,b=>new Pixels(b));}
+    public static void ForgetPixels(Bitmap image){pixelCache.Remove(image);}
     // Callers must not draw on a bitmap and then read it again.
-    public static Color At(Bitmap image,int x,int y){var p=pixelCache.GetValue(image,b=>new Pixels(b));
+    public static Color At(Bitmap image,int x,int y){var p=GetPixels(image);
         if(x<0||y<0||x>=p.Width||y>=p.Height)throw new ArgumentOutOfRangeException("x","像素坐标超出图像");
         int i=y*p.Stride+x*3;return Color.FromArgb(p.Data[i+2],p.Data[i+1],p.Data[i]);}
     public static Bitmap Normalize(Bitmap image)
@@ -250,11 +268,17 @@ static class Vision
     }
     public static double PatchDifference(Bitmap before,Bitmap after,Rectangle box)
     {
-        using(var a=Normalize(before))using(var b=Normalize(after)) {
+        Bitmap a=before.Width==336&&before.Height==622?before:Normalize(before);
+        Bitmap b=after.Width==336&&after.Height==622?after:Normalize(after);
+        try {
+            var pa=GetPixels(a);var pb=GetPixels(b);
             double sum=0;int n=0;var safe=Rectangle.Intersect(box,new Rectangle(0,0,336,622));
-            for(int y=safe.Top;y<safe.Bottom;y+=2)for(int x=safe.Left;x<safe.Right;x+=2){sum+=Difference(Vision.At(a,x,y),Vision.At(b,x,y));n++;}
+            for(int y=safe.Top;y<safe.Bottom;y+=2)for(int x=safe.Left;x<safe.Right;x+=2){
+                int i=y*pa.Stride+x*3,j=y*pb.Stride+x*3;
+                sum+=Math.Abs(pa.Data[i]-pb.Data[j])+Math.Abs(pa.Data[i+1]-pb.Data[j+1])+Math.Abs(pa.Data[i+2]-pb.Data[j+2]);n++;
+            }
             return n==0?0:sum/n;
-        }
+        }finally{if(!ReferenceEquals(a,before))a.Dispose();if(!ReferenceEquals(b,after))b.Dispose();}
     }
 }
 

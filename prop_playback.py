@@ -172,36 +172,49 @@ def run(plan_path):
         n+=1;pending=False;stable=0;last_frame=None;wait_started=time.monotonic()
         atomic_json(play/'prop_state.json',{'next_operation':n,'input_pending':False})
         Image.open(play/'prop_now.png').convert('RGB').save(play/'last_verified.png')
+    def poll_control():
+        nonlocal paused,stop,last_command,stable,last_frame,wait_started
+        if not control.exists():return
+        command=bridge.read(control)
+        if command.get('id')==last_command:return
+        last_command=command.get('id');action=command.get('action')
+        if action=='pause':paused=True;wait_started=time.monotonic()
+        elif action in ('resume','confirm_move_out'):paused=False;stable=0;last_frame=None;wait_started=time.monotonic()
+        elif action=='stop':stop=True
     try:
         if pending:raise ValueError('道具执行断点还有未确认输入，必须先重新核对')
         while n<len(trace):
             bridge.current(plan['mode'],plan['level'],plan['session'])
-            if control.exists():
-                command=bridge.read(control)
-                if command.get('id')!=last_command:
-                    last_command=command.get('id');action=command.get('action')
-                    if action=='pause':paused=True;wait_started=time.monotonic()
-                    elif action in ('resume','confirm_move_out'):paused=False;stable=0;last_frame=None;wait_started=time.monotonic()
-                    elif action=='stop':stop=True
+            poll_control()
             if stop and not pending:break
             if paused:save('paused','道具路线已暂停，进度保留');time.sleep(.15);continue
             target_n=n+1 if pending or trace[n]['kind']=='move_out' else n
             label='waiting_manual_move' if trace[n]['kind']=='move_out' and not pending else 'verifying' if pending else 'running'
             save(label,'请在游戏内使用“移出”并完成广告；完成后点击“已完成移出，核对并继续”' if label=='waiting_manual_move' else f'正在核对道具路线第 {n+1}/{len(trace)} 个操作')
             try:
-                raw=bridge.capture_snapshot(play/'prop_now.png');centers=check_state(plan,cards,trace,target_n,raw,play)
+                raw=bridge.capture_snapshot(play/'prop_now.png')
                 array=np.asarray(Image.open(raw).convert('RGB'),dtype=np.int16)
                 same=last_frame is not None and float(np.abs(array[118:535,20:316]-last_frame[118:535,20:316]).sum(axis=2).mean())<3
                 stable=stable+1 if same else 0;last_frame=array
-                if stable<1:time.sleep(.15);continue
-                check_state(plan,cards,trace,target_n,raw,play,learn=True)
+                # Only a settled frame is worth the full check, except that a
+                # screen which never settles must still reach the timeouts below.
+                if stable<1:
+                    now=time.monotonic()
+                    if pending and now-sent_at>8 or not pending and label!='waiting_manual_move' and now-wait_started>10:check_state(plan,cards,trace,target_n,raw,play)
+                    time.sleep(.05);continue
+                centers=check_state(plan,cards,trace,target_n,raw,play,learn=True)
             except (ValueError,OSError) as exc:
                 stable=0;last_frame=None;error=str(exc)
                 if pending and time.monotonic()-sent_at>8:raise ValueError('点击结果尚未确认，已停止后续输入；'+error)
                 if not pending and label!='waiting_manual_move' and time.monotonic()-wait_started>10:raise ValueError('道具路线起点尚未核对通过，已停止输入；'+error)
                 save(label,('等待手动移出和广告结束；' if label=='waiting_manual_move' else '等待画面稳定；')+error)
-                time.sleep(.3);continue
-            if pending or trace[n]['kind']=='move_out':commit('observed_board_tray_and_side_row');continue
+                time.sleep(.1);continue
+            if pending or trace[n]['kind']=='move_out':
+                commit('observed_board_tray_and_side_row')
+                poll_control()
+                # This stable, fully checked frame is the next operation's start
+                # state, so a following board pick needs no second verification.
+                if n>=len(trace) or stop or paused or trace[n]['kind']=='move_out':continue
             action=trace[n];point=plan['positions'][action['id']] if action['kind']=='board' else centers[action['id']]
             # Reserve the operation before invoking input, so a crash can only
             # leave an explicit pending checkpoint, never an unrecorded replay.
@@ -211,7 +224,7 @@ def run(plan_path):
             result=subprocess.run([str(ROOT/'SheepClicker.Diagnostics.exe'),'--prop-click',str(play/'prop_click_request.json')],cwd=ROOT,
                                   capture_output=True,creationflags=subprocess.CREATE_NO_WINDOW,timeout=10)
             if result.returncode:raise ValueError(result.stderr.decode('utf-8-sig',errors='replace').strip() or '道具点击未发送，需重新核对')
-            stable=0;last_frame=None;save('input_sent',f'已发送第 {n+1} 个操作，核对棋盘、牌槽与移出区');time.sleep(.25)
+            stable=0;last_frame=None;save('input_sent',f'已发送第 {n+1} 个操作，核对棋盘、牌槽与移出区');time.sleep(.1)
         save('sequence_finished' if n==len(trace) else 'paused_at_limit','道具路线已全部核对完成' if n==len(trace) else '已停止，断点保留');return 0
     except Exception as exc:
         save('stopped',str(exc));print(str(exc),flush=True);return 1

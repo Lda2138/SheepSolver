@@ -20,6 +20,10 @@ from standard_plan import check_answer, read
 ENGINE='static_constraint_v1'
 MODEL_VERSION='ordinary-cumulative-2'
 SCHEDULER_VERSION='native-refill-v3-one-move-out'
+# All 19 fresh complete solves on record finished within 9.6 s and none came between
+# 10 and 60 s, so a longer search only delays the one-move-out attempt or a new game.
+NATIVE_SECONDS=12
+CONSTRAINT_SECONDS=5
 SCHEDULER_SOURCES={name:hashlib.sha256((Path(__file__).resolve().parent/name).read_bytes()).hexdigest()
                    for name in ('static_plan.py','static_accelerator.py','search_resources.py','capacity_probe.py','prop_search.py','prop_plan.py')}
 
@@ -30,7 +34,8 @@ def plan_current(map_path,prefix,output,seconds=60,cancel=None,performance='max'
     data=json.loads(raw.decode('utf-8-sig'));cards,rules=initial_cards(data)
     if rules:raise ValueError('静态约束求解只支持普通牌；特殊关继续使用原版当前牌型算法')
     prop_seconds=min(20,max(0,seconds/3)) if len(cards)-len(prefix)>60 and seconds>=15 else 0
-    normal_seconds=max(0,seconds-prop_seconds)
+    normal_seconds=max(0,min(seconds-prop_seconds,NATIVE_SECONDS+CONSTRAINT_SECONDS))
+    seconds=normal_seconds+prop_seconds
     output.mkdir(parents=True,exist_ok=True);start=time.monotonic()
     workers=1 if performance=='eco' else max(1,(os.cpu_count() or 1)//2) if performance=='fast' else (os.cpu_count() or 1)
     identity={'engine':ENGINE,'model_version':MODEL_VERSION,'rules':'standard',
@@ -84,14 +89,14 @@ def plan_current(map_path,prefix,output,seconds=60,cancel=None,performance='max'
         hint=[];store=None;answer=None;acceleration={}
         if len(cards)-len(prefix)>60 and seconds>=15:
             from static_accelerator import prepare
-            acceleration,answer,hint,store=prepare(map_path,data,prefix,output/'accelerator',normal_seconds*.8,
+            acceleration,answer,hint,store=prepare(map_path,data,prefix,output/'accelerator',min(NATIVE_SECONDS,normal_seconds*.8),
                 workers,stopped,lambda **kw:report('searching',
                     f"原生搜索：{kw.get('workers',0)} 路运行，已补位 {kw.get('native_restarts',0)} 次；完整路线验证后执行",**kw))
             report('searching','候选仅作为提示，整局约束可修改早期选择',acceleration=acceleration)
         if answer is not None or acceleration.get('state')=='infeasible':info=dict(acceleration)
         else:
             known=store.load() if store else [];probe=None
-            constraint_seconds=min(normal_seconds*.2,max(0,normal_seconds-(time.monotonic()-start)))
+            constraint_seconds=min(CONSTRAINT_SECONDS,max(0,normal_seconds-(time.monotonic()-start)))
             # CP-SAT uses at most two workers; idle CPUs run the relaxed
             # capacity diagnostic. Its routes are never hints or answers.
             if acceleration and workers>2 and constraint_seconds>=5 and os.name=='nt':
@@ -139,8 +144,8 @@ def plan_current(map_path,prefix,output,seconds=60,cancel=None,performance='max'
                 raise ValueError('当前无道具模型不可满足'+('（仅限已确认前缀）' if prefix else '（整图范围；无独立证明证书）'))
             from capacity_probe import describe
             note=describe(info.get('capacity_probe'))
-            report('limited','本轮约束预算耗尽，可解性仍未知；棋盘保持不动'+('；'+note if note else ''),**{k:v for k,v in info.items() if k!='state'})
-            raise ValueError('本轮约束求解未得到完整答案；可解性未知，不会自动重复同一轮')
+            report('limited','这张图短时间内解不出，可解性未知；棋盘保持不动，请重开一局换图或调低难度'+('；'+note if note else ''),**{k:v for k,v in info.items() if k!='state'})
+            raise ValueError('这张图短时间内解不出，可解性未知；请重开一局换图或调低难度，重开后自动继续')
         method=info.get('method','cp_sat')
         answer.update(engine=ENGINE,model_version=MODEL_VERSION,search_method=method,
             source_label='普通牌完整路线；快速搜索或精确残局回退' if method!='cp_sat' else '普通牌整局约束；候选提示与已证明死局剪枝')

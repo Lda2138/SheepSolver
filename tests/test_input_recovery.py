@@ -58,4 +58,49 @@ class InputRecoveryTests(unittest.TestCase):
             self.assertIn('地图和种子已就绪',str(caught.exception))
 
 
+FIRST = ROOT/'output/auto_capture/sessions/20261103T112117Z-6a7f6b'
+
+
+@unittest.skipUnless((FIRST/'level_0_play/plan.json').exists(), 'captured first-step frame absent')
+class FirstInputRecoveryTests(unittest.TestCase):
+    def boundary(self, directory):
+        folder=Path(directory)/FIRST.name;play=folder/'level_0_play';play.mkdir(parents=True)
+        shutil.copyfile(FIRST/'map_0.json',folder/'map_0.json')
+        plan=bridge.read(FIRST/'level_0_play/plan.json')
+        answer=bridge.read(Path(plan['solution_path']))
+        (folder/'solution.json').write_text(json.dumps(answer),encoding='utf-8')
+        plan['solution_path']=str(folder/'solution.json')
+        source=Path(plan.get('initial_reference_path',plan['reference_path']))
+        shutil.copyfile(source,play/'reference.png')
+        plan['reference_path']=plan['initial_reference_path']=str(play/'reference.png')
+        (play/'plan.json').write_text(json.dumps(plan),encoding='utf-8')
+        status={'pid':1,'state':'stopped','input_pending':True,'next_step':0,'total':len(answer['sequence']),
+                'expected_tray':solution_state(answer,1)[1],'verification_mode':'ultra',
+                'time':(datetime.now(timezone.utc)-timedelta(seconds=10)).isoformat()}
+        (play/'playback_status.json').write_text(json.dumps(status),encoding='utf-8')
+        return folder,play
+
+    def test_first_lost_input_can_resume_without_an_action_log_or_confirmed_frame(self):
+        with tempfile.TemporaryDirectory() as directory,patch('capture_service.alive',return_value=False):
+            folder,play=self.boundary(directory)
+            self.assertFalse((play/'actions.jsonl').exists())
+            self.assertFalse((play/'last_verified.png').exists())
+            self.assertTrue(bridge.reconcile_pending(folder,0,play/'reference.png'))
+            status=bridge.read(play/'playback_status.json')
+            self.assertEqual((status['next_step'],status['input_pending'],status['expected_tray']),(0,False,[]))
+            self.assertEqual((play/'actions.jsonl').read_text(encoding='utf-8'),'')
+            self.assertEqual(bridge.checked_resume(folder,0,play/'reference.png')['start_step'],0)
+            self.assertFalse(bridge.reconcile_pending(folder,0,play/'reference.png'))
+
+    def test_changed_first_frame_is_not_treated_as_a_lost_click(self):
+        from PIL import Image,ImageDraw
+        with tempfile.TemporaryDirectory() as directory,patch('capture_service.alive',return_value=False):
+            folder,play=self.boundary(directory)
+            image=Image.open(play/'reference.png').convert('RGB')
+            ImageDraw.Draw(image).rectangle((20,118,316,467),fill=(193,255,137))
+            changed=play/'changed.png';image.save(changed)
+            with self.assertRaises(ValueError):bridge.reconcile_pending(folder,0,changed)
+            self.assertTrue(bridge.read(play/'playback_status.json')['input_pending'])
+
+
 if __name__=='__main__':unittest.main()

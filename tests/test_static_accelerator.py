@@ -9,7 +9,7 @@ from unittest.mock import patch
 from color_rules import initial_cards
 from desktop_assistant import validate
 from solve_constraints import solve_board
-from static_accelerator import prepare,boundary_cut
+from static_accelerator import prepare,boundary_cut,native_worker_count
 from constraint_conflicts import ConflictStore
 
 
@@ -18,6 +18,12 @@ def flat(count=21):
 
 
 class StaticAcceleratorTests(unittest.TestCase):
+    def test_native_workers_can_exceed_eight_but_obey_requested_cpus_and_memory(self):
+        self.assertEqual(native_worker_count(22,32*1024**3,32),22)
+        self.assertEqual(native_worker_count(22,32*1024**3,6),6)
+        self.assertEqual(native_worker_count(22,1536*1024**2,32),2)
+        self.assertEqual(native_worker_count(1,32*1024**3,32),1)
+        self.assertEqual(native_worker_count(22,0,32),1)
     def write_map(self,folder,data):
         mp=folder/'map.json';mp.write_text(json.dumps(data),encoding='utf-8');return mp
 
@@ -88,6 +94,24 @@ class StaticAcceleratorTests(unittest.TestCase):
             self.assertEqual(notices[0]['workers'],2)
             from static_plan import SCHEDULER_VERSION
             self.assertEqual(notices[0]['scheduler_version'],SCHEDULER_VERSION)
+
+    def test_hard_map_gives_up_early_whatever_the_setting(self):
+        from static_plan import plan_current,NATIVE_SECONDS,CONSTRAINT_SECONDS
+        with tempfile.TemporaryDirectory() as directory:
+            folder=Path(directory);data=flat(66);mp=self.write_map(folder,data);budgets={}
+            def native(*args):
+                budgets['native']=args[4];return {'state':'unknown'},None,[],None
+            def cp(*args,**kw):
+                budgets['constraint']=kw['seconds'];return {'state':'unknown'},None
+            def prop(*args,**kw):
+                budgets['prop']=kw['seconds'];return None
+            with patch('static_accelerator.prepare',side_effect=native),patch('static_plan.solve_board',side_effect=cp),patch('prop_plan.search',side_effect=prop):
+                with self.assertRaisesRegex(ValueError,'重开一局'):plan_current(mp,[],folder/'out',60)
+            self.assertEqual(budgets['native'],NATIVE_SECONDS)
+            self.assertLessEqual(budgets['constraint'],CONSTRAINT_SECONDS)
+            self.assertLessEqual(budgets['prop'],20)
+            status=json.loads((folder/'out/search_status.json').read_text(encoding='utf-8'))
+            self.assertEqual(status['budget_seconds'],NATIVE_SECONDS+CONSTRAINT_SECONDS+20)
 
     def test_cancel_reaps_every_owned_native_process(self):
         processes=[]

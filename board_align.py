@@ -57,6 +57,30 @@ def _component_seed(col,row,centers):
     return np.array([origin[0],origin[1],unit[0],unit[1]])
 
 
+def _axis_seeds(coords,observed):
+    """Vote for grid transforms despite split icons and missing pale frames.
+
+    These are candidates only: fit still checks the frame of EVERY exposed
+    card, and callers independently reject cards outside the map silhouette.
+    """
+    if not len(observed):return []
+    choices=[]
+    for unit in np.arange(2.7,5.501,.02):
+        origins=(observed[:,None]-unit*coords[None,:]).ravel()
+        bins,counts=np.unique(np.rint(origins).astype(int),return_counts=True)
+        for index in np.argsort(counts)[-4:]:
+            group=origins[np.abs(origins-bins[index])<=.75]
+            origin=float(np.median(group))
+            distances=np.abs(origin+unit*coords[:,None]-observed[None,:]).min(axis=1)
+            choices.append((int((distances<=2.5).sum()),-float(np.minimum(distances,5).sum()),origin,float(unit)))
+    choices.sort(reverse=True);kept=[]
+    for _,_,origin,unit in choices:
+        if any(abs(origin-o)<1 and abs(unit-u)<.03 for o,u in kept):continue
+        kept.append((origin,unit))
+        if len(kept)>=48:break
+    return kept
+
+
 def visible_face_count(image_path):
     im=np.asarray(Image.open(image_path).convert('RGB'))
     return len(_face_centers((im[:,:,0]>205)&(im[:,:,1]>205)&(im[:,:,2]>145)))
@@ -118,6 +142,26 @@ def fit(image_path, cards, energy_types=()):
     if seed is not None:
         score=scores(seed[None,:],require_all=True)[0]
         if score>=5.8:return result(seed,score)
+    # Some icons split one frame into multiple pale components, while dense
+    # edges hide other components. Match coordinates with outliers rather than
+    # relying on component count or coordinate-descent initialization.
+    if len(centers)>=4:
+        params=np.array([(x0,y0,ux,uy) for x0,ux in _axis_seeds(col,centers[:,0])
+                         for y0,uy in _axis_seeds(row,centers[:,1])])
+        if len(params):
+            values=scores(params,require_all=True);best=int(np.argmax(values))
+            if values[best]>=5.8:
+                chosen=params[best];coords=np.column_stack((col,row))
+                points=chosen[:2]+coords*chosen[2:]
+                distances=((points[:,None,:]-centers[None,:,:])**2).sum(axis=2)
+                nearest=distances.argmin(axis=1);good=distances.min(axis=1)<36
+                if good.sum()>=4 and len(set(nearest[good]))==good.sum() and all(np.ptp(coords[good,axis])>0 for axis in range(2)):
+                    refined=chosen.copy()
+                    for axis in range(2):
+                        refined[axis],refined[axis+2]=np.linalg.lstsq(np.column_stack((np.ones(good.sum()),coords[good,axis])),centers[nearest[good],axis],rcond=None)[0]
+                    refined_score=scores(refined[None,:],require_all=True)[0]
+                    if refined_score>=5.8:return result(refined,refined_score)
+                return result(chosen,values[best])
     # Fallback for icon fragments which split a pale frame into components.
     candidates=[]
     for start_y in range(120,181,8):
